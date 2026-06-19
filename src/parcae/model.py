@@ -218,6 +218,7 @@ class RecurrentDepthGemma(nn.Module):
 
         # --- New modules (not from pretrained) ---
         self.injection = LTIInjection(self.hidden_size)
+        self.intermediate_norm = nn.LayerNorm(self.hidden_size, eps=1e-6)
 
         if cfg.use_loop_embedding:
             self.loop_embed = LoopEmbedding(
@@ -428,32 +429,47 @@ class RecurrentDepthGemma(nn.Module):
         n_loops: int,
         run_block_fn,
         return_kv_cache: bool = False,
+        show_work: bool = False,
     ):
         """Core recurrent loop shared by forward() and generate().
 
         At each iteration t:
           1. BPTT detach (forward-only, via _bptt_depth attribute)
           2. Loop-index embedding (skip t=0)
-          3. run_block_fn(h, t) → transformer output (possibly with KV tuple)
+          3. run_block_fn(h, t) returns transformer output (+ optional KV)
           4. Depth-wise LoRA adapter
-          5. Injection: bypass at t=0; (A-I)·h + B·e + trans_out at t≥1
+          5. Injection: bypass at t=0; (A-I)·h + B·e + trans_out at t>=1
+          6. If show_work: project h to logits via intermediate_norm + lm_head
 
         Args:
             h: hidden state entering the loop
             e: frozen prelude output for injection
             n_loops: number of iterations
-            run_block_fn: callable (h, t) → trans_out (or (trans_out, kv))
-            return_kv_cache: whether run_block_fn returns KV tuples
+            run_block_fn: callable (h, t) -> trans_out or (trans_out, kv)
+            return_kv_cache: run_block_fn returns KV tuples
+            show_work: capture per-loop intermediate logits. Inference
+                       only -- raises RuntimeError if grad is enabled.
 
         Returns:
-            h if return_kv_cache=False, else (h, kv_list)
+            Always returns (h, kv, thoughts) tuple.
+            kv is None unless return_kv_cache=True.
+            thoughts is None unless show_work=True (then list of
+            (loop_t, logits)).
         """
+        if show_work and torch.is_grad_enabled():
+            raise RuntimeError(
+                "show_work is inference-only. Disable grad or set "
+                "show_work=False for training."
+            )
+
         bptt_depth = getattr(self, '_bptt_depth', None)
         detach_before = None
         if bptt_depth is not None and bptt_depth < n_loops:
             detach_before = n_loops - bptt_depth
 
         kv_rec = [] if return_kv_cache else None
+        thoughts = [] if show_work else None
+
         for t in range(n_loops):
             if detach_before is not None and t < detach_before:
                 h = h.detach()
@@ -476,9 +492,84 @@ class RecurrentDepthGemma(nn.Module):
             else:
                 h = self.injection(h, e, trans_out)
 
-        if return_kv_cache:
-            return h, kv_rec
-        return h
+            if show_work:
+                h_norm = self.intermediate_norm(h)
+                inter_logits = self.lm_head(h_norm)
+                if self._logit_softcap is not None:
+                    inter_logits = self._logit_softcap * torch.tanh(
+                        inter_logits.float() / self._logit_softcap
+                    ).to(inter_logits.dtype)
+                thoughts.append((t, inter_logits.detach()))
+
+        return h, kv_rec, thoughts
+
+    def _forward_pipeline(
+        self,
+        input_ids: torch.Tensor,
+        n_loops: int,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        return_kv_cache: bool = False,
+        show_work: bool = False,
+    ):
+        """Prelude -> Recurrent -> Coda, returning (h, kv_rec, thoughts).
+
+        Shared by forward(), forward_with_thoughts(), and generate().
+        h is the hidden state after coda (before final norm + lm_head).
+        kv_rec is None unless return_kv_cache=True.
+        thoughts is None unless show_work=True.
+        """
+        B, T = input_ids.shape
+        device = input_ids.device
+
+        h = self.embed_tokens(input_ids)
+        if position_ids is None:
+            position_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+        pos_embeds = self._compute_position_embeddings(h, position_ids)
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(
+                config=self._hf_config.text_config, inputs_embeds=h,
+                attention_mask=attention_mask, past_key_values=None,
+                position_ids=position_ids),
+            "sliding_attention": create_sliding_window_causal_mask(
+                config=self._hf_config.text_config, inputs_embeds=h,
+                attention_mask=attention_mask, past_key_values=None,
+                position_ids=position_ids),
+        }
+        shared_kv_states = collections.UserDict()
+        per_layer_inputs = None
+        if hasattr(self, "_ple_enabled") and self._ple_enabled:
+            per_layer_inputs = self._compute_ple(input_ids, h)
+
+        prelude_out = self._run_block(
+            h, self.prelude_indices, pos_embeds, causal_mask_mapping,
+            position_ids, shared_kv_states=shared_kv_states,
+            per_layer_inputs=per_layer_inputs,
+            return_kv_cache=return_kv_cache)
+        h = prelude_out[0] if isinstance(prelude_out, tuple) else prelude_out
+        e = h.clone().detach()
+
+        def _run_rec(h, _t):
+            return self._run_block(
+                h, self.recurrent_indices, pos_embeds,
+                causal_mask_mapping, position_ids,
+                shared_kv_states=shared_kv_states,
+                per_layer_inputs=per_layer_inputs,
+                use_checkpoint=False,
+                return_kv_cache=return_kv_cache)
+
+        h, kv_rec, thoughts = self._recurrent_loop(
+            h, e, n_loops, _run_rec,
+            return_kv_cache=return_kv_cache,
+            show_work=show_work)
+
+        coda_out = self._run_block(
+            h, self.coda_indices, pos_embeds, causal_mask_mapping,
+            position_ids, shared_kv_states=shared_kv_states,
+            per_layer_inputs=per_layer_inputs,
+            return_kv_cache=return_kv_cache)
+        h = coda_out[0] if isinstance(coda_out, tuple) else coda_out
+        return h, kv_rec, thoughts
 
     def forward(
         self,
@@ -497,14 +588,13 @@ class RecurrentDepthGemma(nn.Module):
             n_loops: Number of recurrent loop iterations.
                      Defaults to cfg.default_loops.
                      Set to 1 to match the original pretrained baseline.
-                     Increase to scale test-time compute.
             attention_mask: Optional attention mask
             position_ids: Optional position IDs
             return_logits: If True, return logits. If False, return hidden states.
+            return_kv_cache: Return KV caches for incremental generation.
 
         Returns:
-            Logits of shape (B, T, vocab_size) if return_logits=True,
-            else hidden states of shape (B, T, hidden_size).
+            Logits (B, T, V) or hidden states (B, T, D).
         """
         if not self._is_loaded:
             raise RuntimeError("Call load_pretrained() before forward().")
@@ -513,101 +603,65 @@ class RecurrentDepthGemma(nn.Module):
         if n_loops < 1:
             raise ValueError(f"n_loops must be >= 1 (got {n_loops}). 1 = identity.")
         self._last_n_loops = n_loops
-        B, T = input_ids.shape
-        device = input_ids.device
 
-        # Embed tokens
-        h = self.embed_tokens(input_ids)  # (B, T, 3840)
-
-        # Build position embeddings if not provided
-        if position_ids is None:
-            position_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
-
-        # Precompute RoPE position embeddings for both attention types
-        pos_embeds = self._compute_position_embeddings(h, position_ids)
-
-        # Build attention masks: sliding_attention gets sliding window, full_attention gets full causal
-        causal_mask_mapping = {
-            "full_attention": create_causal_mask(
-                config=self._hf_config.text_config, inputs_embeds=h,
-                attention_mask=attention_mask, past_key_values=None,
-                position_ids=position_ids),
-            "sliding_attention": create_sliding_window_causal_mask(
-                config=self._hf_config.text_config, inputs_embeds=h,
-                attention_mask=attention_mask, past_key_values=None,
-                position_ids=position_ids),
-        }
-
-        # Shared KV states must persist across all blocks in one forward pass.
-        # Some layers store their full-length KV here; later shared layers read it.
-        shared_kv_states = collections.UserDict()
-
-        # Compute Per-Layer Embeddings if the model uses them (E2B/E4B).
-        # PLE depends on input_ids and is constant per forward pass.
-        per_layer_inputs = None
-        if hasattr(self, "_ple_enabled") and self._ple_enabled:
-            per_layer_inputs = self._compute_ple(input_ids, h)
-
-        # --- Prelude ---
-        prelude_out = self._run_block(
-            h, self.prelude_indices, pos_embeds, causal_mask_mapping, position_ids,
-            shared_kv_states=shared_kv_states,
-            per_layer_inputs=per_layer_inputs,
+        h, kv_rec, _ = self._forward_pipeline(
+            input_ids, n_loops,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
             return_kv_cache=return_kv_cache,
+            show_work=False,
         )
-        if return_kv_cache and isinstance(prelude_out, tuple):
-            h = prelude_out[0]
-        else:
-            h = prelude_out
-
-        # e = encoded input, frozen across all loop iterations.
-        # Not injected into the recurrent block input; the recurrent layers
-        # were pretrained to receive h directly, so R(h+e) would distort them.
-        # e is used only in the per-loop injection (A·h + B·e) as a stabilizing
-        # signal that prevents drift across iterations.
-        e = h.clone().detach()
-
-        # --- Recurrent Block ---
-        # Parcae truncated BPTT: gradients only flow through the last
-        # bptt_depth iterations. Handled inside _recurrent_loop.
-        def _run_rec(h, _t):
-            return self._run_block(
-                h, self.recurrent_indices, pos_embeds,
-                causal_mask_mapping, position_ids,
-                shared_kv_states=shared_kv_states,
-                per_layer_inputs=per_layer_inputs,
-                use_checkpoint=False,
-                return_kv_cache=return_kv_cache,
-            )
-
-        rec_result = self._recurrent_loop(
-            h, e, n_loops, _run_rec, return_kv_cache=return_kv_cache)
         if return_kv_cache:
-            h, self._kv_rec = rec_result
-        else:
-            h = rec_result
-
-        # --- Coda ---
-        coda_out = self._run_block(
-            h, self.coda_indices, pos_embeds, causal_mask_mapping, position_ids,
-            shared_kv_states=shared_kv_states,
-            per_layer_inputs=per_layer_inputs,
-            return_kv_cache=return_kv_cache,
-        )
-        if return_kv_cache and isinstance(coda_out, tuple):
-            h = coda_out[0]
-        else:
-            h = coda_out
+            self._kv_rec = kv_rec
 
         if not return_logits:
             return h
 
-        # Final norm and projection
         h = self.norm(h)
         logits = self.lm_head(h)
         if self._logit_softcap is not None:
             logits = self._logit_softcap * torch.tanh(logits.float() / self._logit_softcap).to(logits.dtype)
         return logits
+
+    def forward_with_thoughts(
+        self,
+        input_ids: torch.Tensor,
+        n_loops: int = 2,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, list[tuple[int, torch.Tensor]]]:
+        """Forward pass returning per-loop intermediate logits.
+
+        Projects the hidden state to logits after each recurrent loop
+        iteration using intermediate_norm + lm_head.  Useful for
+        inspecting how the model's predictions evolve with depth.
+
+        intermediate_norm is initialized to identity (weight=1, bias=0)
+        and is NOT pretrained; intermediate logits are approximate.
+        Inference-only; raises RuntimeError if grad is enabled.
+
+        Returns:
+            (final_logits, thoughts) where thoughts is
+            [(loop_t, inter_logits), ...].
+        """
+        if not self._is_loaded:
+            raise RuntimeError("Call load_pretrained() first.")
+        if n_loops < 1:
+            raise ValueError(f"n_loops must be >= 1 (got {n_loops}).")
+        self._last_n_loops = n_loops
+
+        h, _, thoughts = self._forward_pipeline(
+            input_ids, n_loops,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            show_work=True)
+
+        h = self.norm(h)
+        logits = self.lm_head(h)
+        if self._logit_softcap is not None:
+            logits = self._logit_softcap * torch.tanh(
+                logits.float() / self._logit_softcap).to(logits.dtype)
+        return logits, thoughts
 
     @torch.no_grad()
     def generate(
@@ -684,7 +738,7 @@ class RecurrentDepthGemma(nn.Module):
                     shared_kv_states=shared_kv,
                 )
 
-            h = self._recurrent_loop(h, e, n_loops, _run_rec_inc, return_kv_cache=False)
+            h, _, _ = self._recurrent_loop(h, e, n_loops, _run_rec_inc, return_kv_cache=False)
 
             # Coda: incremental with cached KV
             h = self._run_block_incremental(
