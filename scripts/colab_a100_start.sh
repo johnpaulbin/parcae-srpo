@@ -106,10 +106,21 @@ if [[ "${SKIP_INSTALL:-0}" != "1" ]]; then
     fi
 fi
 
+# Unsloth requires Transformers <= 4.57.2. We pin to the highest allowed
+# version because that is the best chance of native Gemma 4 support while
+# keeping Unsloth importable. Override with TRANSFORMERS_VERSION if needed.
+TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION:-4.57.2}"
+
 if [[ "${LOAD_BACKEND}" == "unsloth" ]]; then
     echo "=== Checking Transformers Gemma 4 support ==="
-    "${PYTHON}" - <<'PY'
+    TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION}" "${PYTHON}" - <<'PY'
 import importlib.util
+import os
+import subprocess
+import sys
+
+# Highest Transformers version Unsloth currently allows.
+MAX_TRANSFORMERS = os.environ.get("TRANSFORMERS_VERSION", "4.57.2")
 
 
 def has_gemma4() -> bool:
@@ -119,18 +130,47 @@ def has_gemma4() -> bool:
         return False
 
 
-if not has_gemma4():
-    print(
-        "Transformers local Gemma 4 module is missing. Continuing without "
-        "upgrading Transformers because current Unsloth releases require "
-        "Transformers <= 4.57.2. The model loader will try trusted remote "
-        "model code or fall back to Transformers 4-bit loading if Unsloth "
-        "cannot import."
-    )
-else:
-    import transformers
+def current_version():
+    try:
+        import transformers
+        return transformers.__version__
+    except Exception:
+        return None
 
+
+if has_gemma4():
+    import transformers
     print(f"Transformers Gemma 4 support detected: {transformers.__version__}")
+else:
+    cur = current_version()
+    print(
+        f"Transformers local Gemma 4 module is missing (installed: {cur}). "
+        f"Pinning transformers to {MAX_TRANSFORMERS} (max allowed by Unsloth) "
+        "to try to obtain native Gemma 4 support..."
+    )
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "-q",
+         f"transformers=={MAX_TRANSFORMERS}"]
+    )
+    # Re-import after install to refresh the version.
+    import importlib
+    import transformers
+    importlib.reload(transformers)
+    if has_gemma4():
+        print(f"Transformers Gemma 4 support detected after pin: {transformers.__version__}")
+    else:
+        print(
+            f"ERROR: transformers {transformers.__version__} still has no native "
+            "gemma4 module, and Unsloth requires transformers <= "
+            f"{MAX_TRANSFORMERS}. Cannot load google/gemma-4-E2B-it with this "
+            "combination.\n"
+            "To proceed you can either:\n"
+            "  - set LOAD_BACKEND=transformers and LOAD_IN_4BIT=1, then raise "
+            "TRANSFORMERS_VERSION above 4.57.2, or\n"
+            "  - use a model repo that ships trusted remote modeling code.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 PY
 fi
 

@@ -227,10 +227,22 @@ class RecurrentDepthGemma(nn.Module):
         self.cfg = cfg
 
         # Load config from the pretrained model
-        hf_config = AutoConfig.from_pretrained(
-            cfg.model_path,
-            trust_remote_code=True,
-        )
+        try:
+            hf_config = AutoConfig.from_pretrained(
+                cfg.model_path,
+                trust_remote_code=True,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if "does not recognize this architecture" in msg or "model_type" in msg:
+                raise ValueError(
+                    f"Could not load config for {cfg.model_path!r}: the installed "
+                    "Transformers has no native support for this architecture. "
+                    "Install a Transformers version with native support. If using "
+                    "the Unsloth backend, keep Transformers <= 4.57.2; otherwise "
+                    "switch to load_backend='transformers' and upgrade Transformers."
+                ) from exc
+            raise
         self.hidden_size = hf_config.text_config.hidden_size
         self.num_layers = hf_config.text_config.num_hidden_layers
 
