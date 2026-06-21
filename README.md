@@ -69,6 +69,26 @@ prompts. This is slower for long outputs. The authoritative training loop is
 `scripts/train_srpo.py`; future throughput work can add a maintained vLLM
 generation backend without duplicating the trainer.
 
+For Colab-scale experiments, the preferred path is now the Unsloth SRPO-lite
+extension in `scripts/train_unsloth_srpo.py`. It does not physically loop the
+Gemma 4 hidden states. Instead it uses Unsloth + TRL GRPO with QLoRA and trains
+a smaller code model to emit explicit internal thinking loops:
+
+````text
+<think_loop_1>...</think_loop_1>
+<think_loop_2>...</think_loop_2>
+<think_loop_3>...</think_loop_3>
+<answer>
+```python
+...
+```
+</answer>
+````
+
+This trades recurrent architectural novelty for practical A100 throughput and
+fits the way Unsloth teaches reasoning models: sampled completions, verifier
+rewards, and structured reasoning tags.
+
 DDP training has been verified through code-path analysis and single-GPU
 gloo smoke tests but has not been run on a multi-GPU node with NCCL. We
 expect it to work based on the structural guarantees described above, but
@@ -146,6 +166,27 @@ Useful logging flags:
 python scripts/train_srpo.py --sample-log-every 5 --sample-log-prompts 2
 python scripts/train_srpo.py --sample-log-path runs/my_samples.jsonl
 ```
+
+Unsloth SRPO-lite quickstart:
+
+```bash
+pip install -e ".[unsloth,test]"
+python scripts/train_unsloth_srpo.py --max-steps 300
+```
+
+Colab A100 Unsloth launcher:
+
+```bash
+!git clone https://github.com/johnpaulbin/parcae-srpo.git
+%cd parcae-srpo
+!STEPS=300 MAX_COMPLETION_LENGTH=768 bash scripts/colab_unsloth_srpo_start.sh
+```
+
+The default Unsloth model is
+`unsloth/Qwen2.5-Coder-3B-Instruct-bnb-4bit`. It trains with
+`NUM_GENERATIONS=4`, `TEMPERATURE=1.2`, `LOSS_TYPE=dapo`, and `BETA=0.0` by
+default. Raise `STEPS` first; then consider `MAX_COMPLETION_LENGTH=1024` or
+`NUM_GENERATIONS=6` on A100 if memory allows.
 
 ## Tests
 

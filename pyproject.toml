@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=7"]
 train = ["tensorboard>=2.14"]
+unsloth = ["unsloth", "trl", "diffusers"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
