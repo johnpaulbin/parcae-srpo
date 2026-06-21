@@ -106,6 +106,46 @@ if [[ "${SKIP_INSTALL:-0}" != "1" ]]; then
     fi
 fi
 
+if [[ "${LOAD_BACKEND}" == "unsloth" ]]; then
+    echo "=== Checking Transformers Gemma 4 support ==="
+    "${PYTHON}" - <<'PY'
+import importlib.util
+import subprocess
+import sys
+
+
+def has_gemma4() -> bool:
+    try:
+        return importlib.util.find_spec("transformers.models.gemma4.modeling_gemma4") is not None
+    except Exception:
+        return False
+
+
+if not has_gemma4():
+    print("Gemma 4 module missing after install; upgrading Transformers.")
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-q",
+        "--upgrade",
+        "--pre",
+        "transformers",
+    ])
+
+if has_gemma4():
+    import transformers
+
+    print(f"Transformers Gemma 4 support detected: {transformers.__version__}")
+else:
+    print(
+        "WARNING: Transformers still has no local Gemma 4 module. "
+        "Training will try trusted remote model code at load time."
+    )
+PY
+fi
+
 if [[ -n "${HF_TOKEN:-}" ]]; then
     echo "=== Logging in to Hugging Face from HF_TOKEN ==="
     "${PYTHON}" - <<'PY'

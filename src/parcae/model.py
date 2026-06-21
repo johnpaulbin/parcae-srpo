@@ -41,16 +41,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM
-from transformers.models.gemma4.modeling_gemma4 import create_causal_mask, create_sliding_window_causal_mask
-# Support both gemma4 (E2B/E4B/31B) and gemma4_unified (12B)
-try:
-    from transformers.models.gemma4_unified.modeling_gemma4_unified import (
-        Gemma4UnifiedForConditionalGeneration,
-        Gemma4UnifiedTextDecoderLayer,
-    )
-    _HAS_UNIFIED = True
-except ImportError:
-    _HAS_UNIFIED = False
 
 from .injection import LTIInjection
 
@@ -72,6 +62,17 @@ def _find_first_module_path(root, paths: list[str]):
         if value is not None:
             return path, value
     return None, None
+
+
+def _find_gemma4_mask_fns(language_model):
+    """Resolve Gemma 4 mask helpers from the loaded model implementation."""
+    import importlib
+
+    module = importlib.import_module(language_model.__class__.__module__)
+    return (
+        getattr(module, "create_causal_mask", None),
+        getattr(module, "create_sliding_window_causal_mask", None),
+    )
 
 
 def _layer_forward(layer, hidden_states, per_layer_input, shared_kv_states,
@@ -226,7 +227,10 @@ class RecurrentDepthGemma(nn.Module):
         self.cfg = cfg
 
         # Load config from the pretrained model
-        hf_config = AutoConfig.from_pretrained(cfg.model_path)
+        hf_config = AutoConfig.from_pretrained(
+            cfg.model_path,
+            trust_remote_code=True,
+        )
         self.hidden_size = hf_config.text_config.hidden_size
         self.num_layers = hf_config.text_config.num_hidden_layers
 
@@ -242,7 +246,7 @@ class RecurrentDepthGemma(nn.Module):
         # Create the full model structure. We'll populate weights from pretrained.
         # Using a lazy approach: load the full HF model, extract layers, reassign.
         self._hf_config = hf_config
-        self._layers: dict[int, Gemma4UnifiedTextDecoderLayer] = {}
+        self._layers: dict[int, nn.Module] = {}
 
         # --- New modules (not from pretrained) ---
         self.injection = LTIInjection(self.hidden_size)
@@ -297,6 +301,7 @@ class RecurrentDepthGemma(nn.Module):
             kwargs = {
                 "torch_dtype": torch.bfloat16,
                 "low_cpu_mem_usage": True,
+                "trust_remote_code": True,
             }
             if load_in_4bit:
                 from transformers import BitsAndBytesConfig
@@ -323,14 +328,22 @@ class RecurrentDepthGemma(nn.Module):
                     "The Unsloth backend requires `pip install -e .[unsloth]` "
                     "or `pip install unsloth`."
                 ) from exc
+            unsloth_kwargs = {
+                "model_name": self.cfg.model_path,
+                "max_seq_length": self.cfg.max_seq_length,
+                "dtype": None,
+                "load_in_4bit": self.cfg.load_in_4bit,
+                "fast_inference": self.cfg.fast_inference,
+                "trust_remote_code": True,
+            }
             try:
-                hf_model, _tokenizer = FastLanguageModel.from_pretrained(
-                    model_name=self.cfg.model_path,
-                    max_seq_length=self.cfg.max_seq_length,
-                    dtype=None,
-                    load_in_4bit=self.cfg.load_in_4bit,
-                    fast_inference=self.cfg.fast_inference,
-                )
+                try:
+                    hf_model, _tokenizer = FastLanguageModel.from_pretrained(**unsloth_kwargs)
+                except TypeError as exc:
+                    if "trust_remote_code" not in str(exc):
+                        raise
+                    unsloth_kwargs.pop("trust_remote_code", None)
+                    hf_model, _tokenizer = FastLanguageModel.from_pretrained(**unsloth_kwargs)
                 self._quantized_backbone = bool(self.cfg.load_in_4bit)
             except Exception as exc:
                 if not self.cfg.load_in_4bit:
@@ -377,6 +390,9 @@ class RecurrentDepthGemma(nn.Module):
                 "Could not locate the Gemma 4 language_model inside the "
                 f"{self.cfg.load_backend} model wrapper."
             )
+        self._create_causal_mask, self._create_sliding_window_causal_mask = (
+            _find_gemma4_mask_fns(language_model)
+        )
 
         # Extract layers
         for idx in range(self.num_layers):
@@ -667,15 +683,21 @@ class RecurrentDepthGemma(nn.Module):
             if attention_mask is not None:
                 position_ids = attention_mask.long().cumsum(dim=-1) - 1
                 position_ids = position_ids.masked_fill(attention_mask == 0, 0)
-            else:
-                position_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+        else:
+            position_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
         pos_embeds = self._compute_position_embeddings(h, position_ids)
+        if self._create_causal_mask is None or self._create_sliding_window_causal_mask is None:
+            raise RuntimeError(
+                "The loaded Gemma 4 implementation does not expose causal mask "
+                "helpers. Upgrade Transformers to a Gemma-4-capable build or "
+                "use a model repository with trusted remote modeling code."
+            )
         causal_mask_mapping = {
-            "full_attention": create_causal_mask(
+            "full_attention": self._create_causal_mask(
                 config=self._hf_config.text_config, inputs_embeds=h,
                 attention_mask=attention_mask, past_key_values=None,
                 position_ids=position_ids),
-            "sliding_attention": create_sliding_window_causal_mask(
+            "sliding_attention": self._create_sliding_window_causal_mask(
                 config=self._hf_config.text_config, inputs_embeds=h,
                 attention_mask=attention_mask, past_key_values=None,
                 position_ids=position_ids),
