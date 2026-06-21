@@ -28,6 +28,8 @@ Common overrides:
   MAX_RESPONSE_TOKENS=512    completion token budget
   MICRO_BATCH_SIZE=1         prompts per step on the A100
   GRAD_ACCUM_STEPS=8         gradient accumulation steps
+  GRPO_FORWARD_BATCH_SIZE=1  GRPO log-prob forward chunk size
+  SDPO_FORWARD_BATCH_SIZE=1  SDPO KL forward chunk size
   MAX_LOOPS=6                max recurrent depth for A100 startup runs
   SAMPLE_LOG_EVERY=1         print full samples every N steps
   SAMPLE_LOG_PROMPTS=1       prompt groups to print per sample log
@@ -78,7 +80,7 @@ fi
 
 if [[ "${SKIP_INSTALL:-0}" != "1" ]]; then
     echo "=== Installing repo and training dependencies ==="
-    "${PYTHON}" -m pip install -q --upgrade pip setuptools wheel
+    "${PYTHON}" -m pip install -q --upgrade pip wheel "setuptools<82"
     "${PYTHON}" -m pip install -q -e ".[train,test]" "huggingface_hub>=0.24"
 fi
 
@@ -135,6 +137,8 @@ MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-512}" \
 MAX_RESPONSE_TOKENS="${MAX_RESPONSE_TOKENS:-512}" \
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}" \
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-8}" \
+GRPO_FORWARD_BATCH_SIZE="${GRPO_FORWARD_BATCH_SIZE:-1}" \
+SDPO_FORWARD_BATCH_SIZE="${SDPO_FORWARD_BATCH_SIZE:-1}" \
 POISSON_MEAN="${POISSON_MEAN:-2}" \
 MAX_LOOPS="${MAX_LOOPS:-6}" \
 LEARNING_RATE="${LEARNING_RATE:-5e-4}" \
@@ -170,6 +174,8 @@ cfg.max_prompt_tokens = int_env("MAX_PROMPT_TOKENS", cfg.max_prompt_tokens)
 cfg.max_response_tokens = int_env("MAX_RESPONSE_TOKENS", cfg.max_response_tokens)
 cfg.micro_batch_size = int_env("MICRO_BATCH_SIZE", cfg.micro_batch_size)
 cfg.gradient_accumulation_steps = int_env("GRAD_ACCUM_STEPS", cfg.gradient_accumulation_steps)
+cfg.grpo_forward_batch_size = int_env("GRPO_FORWARD_BATCH_SIZE", cfg.grpo_forward_batch_size)
+cfg.sdpo_forward_batch_size = int_env("SDPO_FORWARD_BATCH_SIZE", cfg.sdpo_forward_batch_size)
 cfg.poisson_mean = int_env("POISSON_MEAN", cfg.poisson_mean)
 cfg.max_loops = int_env("MAX_LOOPS", cfg.max_loops)
 cfg.learning_rate = float_env("LEARNING_RATE", cfg.learning_rate)
@@ -192,6 +198,8 @@ for name in [
     "max_response_tokens",
     "micro_batch_size",
     "gradient_accumulation_steps",
+    "grpo_forward_batch_size",
+    "sdpo_forward_batch_size",
     "poisson_mean",
     "max_loops",
     "learning_rate",

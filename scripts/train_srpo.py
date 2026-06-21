@@ -68,6 +68,8 @@ class TrainConfig:
     clip_epsilon_high: float = 0.28        # GSPO Clip-Higher
     kl_beta: float = 0.0
     entropy_weight: float = 0.01           # SRPO entropy-aware weighting
+    grpo_forward_batch_size: int = 1       # memory guard for long code outputs
+    sdpo_forward_batch_size: int = 1       # memory guard for teacher-correction KL
 
     # ── Optimization ──
     micro_batch_size: int = 2              # prompts per micro-batch (per GPU)
@@ -394,25 +396,31 @@ def sdpo_loss(
         student_logits = student_logits.unsqueeze(0)   # (1, L, V)
         teacher_logits = teacher_logits.unsqueeze(0)
         response_mask = response_mask.unsqueeze(0)      # (1, L)
-    B, L, V = student_logits.shape
+    active = response_mask > 0
+    if not active.any():
+        return student_logits.sum() * 0.0
 
-    student_lp = F.log_softmax(student_logits.float(), dim=-1).to(student_logits.dtype)
-    teacher_p  = F.softmax(teacher_logits.float(), dim=-1).to(student_logits.dtype)
+    student_active = student_logits[active]
+    teacher_active = teacher_logits[active]
+    V = student_active.shape[-1]
+
+    student_lp = F.log_softmax(student_active.float(), dim=-1).to(student_active.dtype)
+    teacher_p = F.softmax(teacher_active.float(), dim=-1).to(student_active.dtype)
 
     # token-level reverse KL: KL(p_student || p_teacher)
     kl = F.kl_div(
         student_lp.float(), teacher_p.float(),
         reduction="none", log_target=False,
-    ).sum(dim=-1).to(student_logits.dtype)  # (B, L)
+    ).sum(dim=-1).to(student_active.dtype)
 
     # entropy-aware weight
-    teacher_log_p = F.log_softmax(teacher_logits.float(), dim=-1).to(teacher_logits.dtype)
-    H = -(teacher_p.float() * teacher_log_p.float()).sum(dim=-1).to(teacher_logits.dtype)
+    teacher_log_p = F.log_softmax(teacher_active.float(), dim=-1).to(teacher_active.dtype)
+    H = -(teacher_p.float() * teacher_log_p.float()).sum(dim=-1).to(teacher_active.dtype)
     H_max = math.log(V)
-    w = 1.0 - entropy_weight * (H / H_max)  # (B, L) in (0, 1]
+    w = 1.0 - entropy_weight * (H / H_max)
 
-    weighted = kl * w * response_mask  # (B, L)
-    return (weighted.float().sum() / response_mask.sum().clamp(min=1).float()).to(weighted.dtype)
+    weighted = kl * w
+    return weighted.float().mean().to(weighted.dtype)
 
 
 # ── Feedback ───────────────────────────────────────────────────────────
@@ -624,7 +632,7 @@ class SRPOTrainer:
                 })
         return results
 
-    def train_step(self, batch: list[dict]) -> dict:
+    def train_step(self, batch: list[dict], loss_scale: Optional[float] = None) -> dict:
         cfg = self.cfg
         G = cfg.group_size
         raw_prompts = [b["prompt"] for b in batch]
@@ -697,41 +705,84 @@ class SRPOTrainer:
             rwd = torch.tensor([c["reward"] for c in policy_samples], device=self.device)
             group_ids = torch.tensor([c["batch_idx"] for c in policy_samples], device=self.device)
 
-            # Current-policy log-probs must be recomputed with grad.  The
-            # generation-time logprobs are under no_grad and cannot train GRPO.
-            logits_cur = self.model(
-                input_ids=batch_ids,
-                attention_mask=batch_attn,
-                n_loops=T,
-                return_logits=True,
-            )
-            log_probs_cur = F.log_softmax(logits_cur.float(), dim=-1).to(logits_cur.dtype)
-            lp = torch.zeros(len(policy_samples), L_max, device=self.device, dtype=log_probs_cur.dtype)
-            for j, c in enumerate(policy_samples):
-                L = c["full_ids"].shape[0]
-                PL = c["prompt_len"]
-                if L > PL:
-                    gen_pos = torch.arange(PL, L, device=self.device)
-                    lp[j, PL:L] = log_probs_cur[j, gen_pos - 1, batch_ids[j, gen_pos]]
+            # Current-policy log-probs must be recomputed with grad.  Chunking
+            # keeps long code outputs viable on 40GB A100 Colab runtimes.
+            cur_rows = []
+            grpo_bs = max(1, cfg.grpo_forward_batch_size)
+            for start in range(0, len(policy_samples), grpo_bs):
+                end = min(start + grpo_bs, len(policy_samples))
+                chunk_len = int(batch_attn[start:end].sum(dim=-1).max().item())
+                ids_chunk = batch_ids[start:end, :chunk_len]
+                attn_chunk = batch_attn[start:end, :chunk_len]
+                logits_cur = self.model(
+                    input_ids=ids_chunk,
+                    attention_mask=attn_chunk,
+                    n_loops=T,
+                    return_logits=True,
+                )
+                chunk_rows = []
+                for local_j, c in enumerate(policy_samples[start:end]):
+                    L = c["full_ids"].shape[0]
+                    PL = c["prompt_len"]
+                    if L > PL:
+                        gen_pos = torch.arange(PL, L, device=self.device)
+                        selected = logits_cur[local_j, gen_pos - 1, :]
+                        selected_lp = F.log_softmax(selected.float(), dim=-1).to(selected.dtype)
+                        token_lp = selected_lp.gather(
+                            -1,
+                            batch_ids[start + local_j, gen_pos].unsqueeze(-1),
+                        ).squeeze(-1)
+                        row = torch.zeros(
+                            L_max,
+                            device=self.device,
+                            dtype=token_lp.dtype,
+                        ).scatter(0, gen_pos, token_lp)
+                    else:
+                        row = torch.zeros(L_max, device=self.device, dtype=logits_cur.dtype)
+                    chunk_rows.append(row)
+                cur_rows.append(torch.stack(chunk_rows))
+                del logits_cur
+            lp = torch.cat(cur_rows, dim=0)
 
             # Old-policy log-probs: forward with old-policy modules swapped in.
             # Uses context manager to guarantee restoration even on exception.
+            old_rows = []
             with self._old_policy_ctx():
                 with torch.no_grad():
-                    logits_old = self._model_unwrapped.forward(
-                        input_ids=batch_ids,
-                        attention_mask=batch_attn,
-                        n_loops=T,
-                        return_logits=True,
-                    )
-            log_probs_old = F.log_softmax(logits_old.float(), dim=-1).to(logits_old.dtype)
-            lp_old = torch.zeros(len(policy_samples), L_max, device=self.device, dtype=log_probs_old.dtype)
-            for j, c in enumerate(policy_samples):
-                L = c["full_ids"].shape[0]
-                PL = c["prompt_len"]
-                if L > PL:
-                    gen_pos = torch.arange(PL, L, device=self.device)
-                    lp_old[j, PL:L] = log_probs_old[j, gen_pos - 1, batch_ids[j, gen_pos]]
+                    for start in range(0, len(policy_samples), grpo_bs):
+                        end = min(start + grpo_bs, len(policy_samples))
+                        chunk_len = int(batch_attn[start:end].sum(dim=-1).max().item())
+                        ids_chunk = batch_ids[start:end, :chunk_len]
+                        attn_chunk = batch_attn[start:end, :chunk_len]
+                        logits_old = self._model_unwrapped.forward(
+                            input_ids=ids_chunk,
+                            attention_mask=attn_chunk,
+                            n_loops=T,
+                            return_logits=True,
+                        )
+                        chunk_rows = []
+                        for local_j, c in enumerate(policy_samples[start:end]):
+                            L = c["full_ids"].shape[0]
+                            PL = c["prompt_len"]
+                            if L > PL:
+                                gen_pos = torch.arange(PL, L, device=self.device)
+                                selected = logits_old[local_j, gen_pos - 1, :]
+                                selected_lp = F.log_softmax(selected.float(), dim=-1).to(selected.dtype)
+                                token_lp = selected_lp.gather(
+                                    -1,
+                                    batch_ids[start + local_j, gen_pos].unsqueeze(-1),
+                                ).squeeze(-1)
+                                row = torch.zeros(
+                                    L_max,
+                                    device=self.device,
+                                    dtype=token_lp.dtype,
+                                ).scatter(0, gen_pos, token_lp)
+                            else:
+                                row = torch.zeros(L_max, device=self.device, dtype=logits_old.dtype)
+                            chunk_rows.append(row)
+                        old_rows.append(torch.stack(chunk_rows))
+                        del logits_old
+            lp_old = torch.cat(old_rows, dim=0)
 
             grpo_l = grpo_loss(
                 lp,
@@ -742,6 +793,17 @@ class SRPOTrainer:
                 cfg.clip_epsilon_high,
                 group_ids=group_ids,
             )
+
+        grpo_value = float(grpo_l.detach().item())
+        if loss_scale is not None:
+            if grpo_l.requires_grad:
+                with torch.amp.autocast('cuda', enabled=False):
+                    self.scaler.scale(grpo_l * loss_scale).backward()
+            grpo_l = grpo_l.detach()
+            if len(policy_samples) >= 2:
+                del lp, lp_old, batch_ids, batch_attn, batch_mask, rwd, group_ids, cur_rows, old_rows
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
         # --- SDPO branch: failed samples (batched) ---
         failed = [c for c in comps if c["reward"] <= 0 and c.get("sdpo_feedback")]
@@ -794,43 +856,83 @@ class SRPOTrainer:
                 teacher_full_ids[j, :L] = ids.to(self.device)
                 teacher_attn[j, :L] = 1
 
-            # Student: current policy (DDP, grad enabled)
-            stu_logits = self.model(
-                input_ids=teacher_full_ids,
-                attention_mask=teacher_attn,
-                n_loops=T,
-                return_logits=True,
-            )
-            # Teacher: old policy forward (no grad)
-            with self._old_policy_ctx():
-                with torch.no_grad():
-                    tea_logits = self._model_unwrapped.forward(
-                        input_ids=teacher_full_ids,
-                        attention_mask=teacher_attn,
-                        n_loops=T,
-                        return_logits=True,
-                    )
+            sdpo_terms = []
+            sdpo_den = torch.tensor(0.0, device=self.device)
+            sdpo_num_value = 0.0
+            sdpo_den_value = 0.0
+            sdpo_bs = max(1, cfg.sdpo_forward_batch_size)
+            total_resp_tokens = torch.tensor(
+                sum(
+                    max(0, int(teacher_attn[j].sum().item()) - int(tp_lens[j]))
+                    for j in range(len(failed))
+                ),
+                device=self.device,
+                dtype=torch.float32,
+            ).clamp_min(1.0)
+            for start in range(0, len(failed), sdpo_bs):
+                end = min(start + sdpo_bs, len(failed))
+                chunk_len = int(teacher_attn[start:end].sum(dim=-1).max().item())
+                ids_chunk = teacher_full_ids[start:end, :chunk_len]
+                attn_chunk = teacher_attn[start:end, :chunk_len]
 
-            # Batched response mask: (B, TL) where B = len(failed)
-            resp_mask = torch.zeros(len(failed), TL, device=self.device)
-            for j, pl in enumerate(tp_lens):
-                resp_mask[j, pl:teacher_attn[j].sum().item()] = 1
+                # Student: current policy (DDP, grad enabled)
+                stu_logits = self.model(
+                    input_ids=ids_chunk,
+                    attention_mask=attn_chunk,
+                    n_loops=T,
+                    return_logits=True,
+                )
+                # Teacher: old policy forward (no grad)
+                with self._old_policy_ctx():
+                    with torch.no_grad():
+                        tea_logits = self._model_unwrapped.forward(
+                            input_ids=ids_chunk,
+                            attention_mask=attn_chunk,
+                            n_loops=T,
+                            return_logits=True,
+                        )
 
-            # Compute SDPO loss over entire batch (vectorized)
-            sdpo_l = sdpo_loss(
-                stu_logits, tea_logits, resp_mask, cfg.entropy_weight)
+                resp_mask = torch.zeros(end - start, chunk_len, device=self.device)
+                for local_j, pl in enumerate(tp_lens[start:end]):
+                    resp_mask[local_j, pl:attn_chunk[local_j].sum().item()] = 1
 
-        total_loss = grpo_l + sdpo_l
-        if not total_loss.requires_grad:
-            total_loss = sum(p.sum() * 0.0 for p in self.trainable_params())
-        # Loss returned to caller for gradient accumulation.
-        # Backward is called in train() after accumulating over micro-batches.
+                n_resp = resp_mask.sum()
+                if n_resp > 0:
+                    chunk_l = sdpo_loss(stu_logits, tea_logits, resp_mask, cfg.entropy_weight)
+                    n_resp_value = float(n_resp.detach().item())
+                    sdpo_num_value += float(chunk_l.detach().item()) * n_resp_value
+                    sdpo_den_value += n_resp_value
+                    if loss_scale is None:
+                        sdpo_terms.append(chunk_l * n_resp)
+                        sdpo_den = sdpo_den + n_resp
+                    elif chunk_l.requires_grad:
+                        chunk_weight = n_resp / total_resp_tokens
+                        with torch.amp.autocast('cuda', enabled=False):
+                            self.scaler.scale(chunk_l * chunk_weight * loss_scale).backward()
+                    del chunk_l
+                del stu_logits, tea_logits, resp_mask
+                if loss_scale is not None and self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            if loss_scale is not None and sdpo_den_value > 0:
+                sdpo_l = torch.tensor(sdpo_num_value / sdpo_den_value, device=self.device)
+            elif sdpo_terms:
+                sdpo_l = sum(sdpo_terms) / sdpo_den.clamp_min(1.0)
+
+        sdpo_value = float(sdpo_l.detach().item())
+        total_value = grpo_value + sdpo_value
+        if loss_scale is None:
+            total_loss = grpo_l + sdpo_l
+            if not total_loss.requires_grad:
+                total_loss = sum(p.sum() * 0.0 for p in self.trainable_params())
+        else:
+            total_loss = torch.tensor(total_value, device=self.device)
 
         metrics = {
             "total_loss": total_loss,
-            "loss": total_loss.item(),
-            "grpo_loss": grpo_l.item(),
-            "sdpo_loss": sdpo_l.item(),
+            "loss": total_value,
+            "grpo_loss": grpo_value,
+            "sdpo_loss": sdpo_value,
             "reward_mean": sum(c["reward"] for c in comps) / len(comps) if comps else 0,
             "T": T,
             "T_bwd": T_bwd,
@@ -997,8 +1099,10 @@ class SRPOTrainer:
                 # forward (autocast bf16), then backward scaled by GA steps
                 with sync_ctx:
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                        metrics = self.train_step(list(batch))
-                    self.scaler.scale(metrics["total_loss"] / cfg.gradient_accumulation_steps).backward()
+                        metrics = self.train_step(
+                            list(batch),
+                            loss_scale=1.0 / cfg.gradient_accumulation_steps,
+                        )
 
             # optimizer step
             self.scaler.unscale_(self.optimizer)
@@ -1113,6 +1217,10 @@ def main():
                     help="JSONL path for full prompt/completion sample logs")
     ap.add_argument("--no-sample-log", action="store_true",
                     help="Disable full prompt/completion sample logging")
+    ap.add_argument("--grpo-forward-batch-size", type=int, default=None,
+                    help="Chunk size for GRPO current/reference log-prob forwards")
+    ap.add_argument("--sdpo-forward-batch-size", type=int, default=None,
+                    help="Chunk size for SDPO student/teacher forwards")
     args = ap.parse_args()
 
     def apply_overrides(cfg: TrainConfig) -> bool:
@@ -1132,6 +1240,12 @@ def main():
         if args.no_sample_log:
             cfg.sample_log_every = 0
             changed = True
+        if args.grpo_forward_batch_size is not None:
+            cfg.grpo_forward_batch_size = args.grpo_forward_batch_size
+            changed = True
+        if args.sdpo_forward_batch_size is not None:
+            cfg.sdpo_forward_batch_size = args.sdpo_forward_batch_size
+            changed = True
         return changed
 
     if args.resume:
@@ -1142,6 +1256,8 @@ def main():
             args.sample_log_prompts is not None,
             args.sample_log_path is not None,
             args.no_sample_log,
+            args.grpo_forward_batch_size is not None,
+            args.sdpo_forward_batch_size is not None,
         ]):
             ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
             cfg = ckpt["config"]

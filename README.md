@@ -128,12 +128,17 @@ In a notebook, use shell cells:
 The Colab script installs the package, checks that CUDA is available, warns if
 the runtime is not an A100, predownloads the model when possible, runs focused
 tests, and starts a single-GPU A100 training run. It defaults to full sample
-logging every step for easy inspection. While it is running, inspect samples
-with:
+logging every step for easy inspection. The trainer chunks GRPO and SDPO
+forward passes by default on Colab, so the long 512-token code budget can run
+on 40GB A100 runtimes without batching all correction sequences into one giant
+KL forward. While it is running, inspect samples with:
 
 ```bash
 !tail -n 80 runs/colab_a100_samples.jsonl
 ```
+
+If you raise `MAX_RESPONSE_TOKENS`, `GROUP_SIZE`, or `MAX_LOOPS`, keep the
+forward chunks at `GRPO_FORWARD_BATCH_SIZE=1 SDPO_FORWARD_BATCH_SIZE=1` first.
 
 Useful logging flags:
 
