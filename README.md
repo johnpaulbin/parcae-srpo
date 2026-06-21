@@ -38,12 +38,20 @@ Failed completions train under self-distillation (SDPO), where an old-policy
 snapshot generates a corrected version conditioned on the error feedback,
 and the student minimizes the reverse KL divergence to that teacher.
 
-Generation is batched and single-pass: log-probabilities are captured during
-autoregression, eliminating the separate forward pass that naive
-implementations require. Training uses bf16 automatic mixed precision with
-gradient scaling and accumulation over 4 micro-batches. On a single RTX 5090
-the loop runs at approximately 6 seconds per step with a group size of 2 and
-a maximum response length of 16 tokens.
+Training samples groups at high temperature (`1.2`) so each prompt is more
+likely to produce mixed pass/fail completions. GRPO is computed over every
+completion in the prompt group, with current-policy log-probabilities
+recomputed under gradient; generation-time log-probabilities are diagnostic
+only. Failed completions additionally train through SDPO. The default
+response budget is 512 tokens so code solutions can complete, at the cost of
+slower steps.
+
+Rank 0 logs intermediate model samples automatically at the same early-step
+and `sample_log_every` cadence used for progress inspection. Each sample log
+prints the full raw prompt, the full chat-template prompt sent to the model,
+the full model completion, GRPO loss, SDPO loss, reward, and verifier
+feedback. The same untruncated records are appended as JSONL to
+`runs/samples.jsonl` by default.
 
 Multi-GPU training uses PyTorch DistributedDataParallel with
 `find_unused_parameters=False`. All trainable parameters are consumed in
@@ -55,12 +63,11 @@ used by TRL's `unwrap_model_for_generation`.
 
 ## Limitations
 
-We have not yet observed a training signal where the model produces correct
-code at T>1 in a sustained way. The GRPO branch remains inactive until at
-least two completions in a group pass verification, which has not occurred
-consistently with the current builtin 20-problem dataset. We suspect this is
-a data quality issue (small, synthetic prompts) rather than a fundamental
-architectural problem, but we have not verified this.
+The pure PyTorch recurrent generator is correct-first and intentionally avoids
+padded batched generation, because the custom KV cache expects unpadded
+prompts. This is slower for long outputs. The authoritative training loop is
+`scripts/train_srpo.py`; future throughput work can add a maintained vLLM
+generation backend without duplicating the trainer.
 
 DDP training has been verified through code-path analysis and single-GPU
 gloo smoke tests but has not been run on a multi-GPU node with NCCL. We
@@ -102,10 +109,43 @@ CUDA_VISIBLE_DEVICES=0 python scripts/train_srpo.py      # single GPU
 torchrun --nproc_per_node=2 scripts/train_srpo.py         # multi-GPU DDP
 ```
 
+Colab A100 quickstart:
+
+```bash
+git clone https://github.com/IgorAlexey/parcae-srpo.git
+cd parcae-srpo
+HF_TOKEN=hf_... STEPS=100 bash scripts/colab_a100_start.sh
+```
+
+In a notebook, use shell cells:
+
+```bash
+!git clone https://github.com/IgorAlexey/parcae-srpo.git
+%cd parcae-srpo
+!HF_TOKEN=hf_... STEPS=100 bash scripts/colab_a100_start.sh
+```
+
+The Colab script installs the package, checks that CUDA is available, warns if
+the runtime is not an A100, predownloads the model when possible, runs focused
+tests, and starts a single-GPU A100 training run. It defaults to full sample
+logging every step for easy inspection. While it is running, inspect samples
+with:
+
+```bash
+!tail -n 80 runs/colab_a100_samples.jsonl
+```
+
+Useful logging flags:
+
+```bash
+python scripts/train_srpo.py --sample-log-every 5 --sample-log-prompts 2
+python scripts/train_srpo.py --sample-log-path runs/my_samples.jsonl
+```
+
 ## Tests
 
 ```bash
-pytest tests/ -v    # 15 tests: identity verification, context manager correctness
+pytest tests/ -v
 ```
 
 ## Citation

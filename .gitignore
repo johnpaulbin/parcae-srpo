@@ -7,4 +7,12 @@ dist/
 build/
 models/
 checkpoints/
+runs/
 .venv/
+venv/
+*.pt
+training_log*.txt
+train_log*.txt
+colab_key
+colab_key.pub
+colabssh.txt

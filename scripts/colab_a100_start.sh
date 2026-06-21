@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# Colab A100 bootstrap for parcae-srpo.
+#
+# Run from the repository root on a Colab A100 runtime:
+#   HF_TOKEN=hf_... STEPS=100 bash scripts/colab_a100_start.sh
+#
+# Useful overrides:
+#   STEPS=25 SAMPLE_LOG_EVERY=1 bash scripts/colab_a100_start.sh
+#   MAX_RESPONSE_TOKENS=768 GROUP_SIZE=4 bash scripts/colab_a100_start.sh
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Colab A100 startup script for parcae-srpo.
+
+Required before training gated/private models:
+  export HF_TOKEN=hf_...
+
+Common overrides:
+  STEPS=100                  training steps (default: 100)
+  MODEL_NAME=...             Hugging Face model id (default: google/gemma-4-E2B-it)
+  MODEL_PATH=/path/to/model   local model path, if already downloaded
+  DATASET=humaneval_mbpp_mix dataset name
+  MAX_PROMPTS=500            number of dataset prompts
+  GROUP_SIZE=4               completions per prompt
+  MAX_PROMPT_TOKENS=512      prompt token budget
+  MAX_RESPONSE_TOKENS=512    completion token budget
+  MICRO_BATCH_SIZE=1         prompts per step on the A100
+  GRAD_ACCUM_STEPS=8         gradient accumulation steps
+  MAX_LOOPS=6                max recurrent depth for A100 startup runs
+  SAMPLE_LOG_EVERY=1         print full samples every N steps
+  SAMPLE_LOG_PROMPTS=1       prompt groups to print per sample log
+  SAMPLE_LOG_PATH=...        JSONL path for full sample logs
+  RUN_TESTS=1                run focused tests before training
+  PREDOWNLOAD=1              predownload the model before training
+  SKIP_INSTALL=1             skip pip install
+
+Example:
+  HF_TOKEN=hf_... STEPS=50 SAMPLE_LOG_EVERY=1 bash scripts/colab_a100_start.sh
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+PYTHON="${PYTHON:-python3}"
+MODEL_NAME="${MODEL_NAME:-google/gemma-4-E2B-it}"
+HF_HOME="${HF_HOME:-/content/hf-cache}"
+HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/content/hf-datasets-cache}"
+SAMPLE_LOG_PATH="${SAMPLE_LOG_PATH:-runs/colab_a100_samples.jsonl}"
+
+export HF_HOME
+export HF_DATASETS_CACHE
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+echo "=== parcae-srpo Colab A100 startup ==="
+echo "Repo: ${REPO_ROOT}"
+echo "Python: $(${PYTHON} --version)"
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "ERROR: nvidia-smi not found. In Colab, select Runtime > Change runtime type > A100 GPU." >&2
+    exit 1
+fi
+
+nvidia-smi
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)"
+if [[ "${GPU_NAME}" != *"A100"* ]]; then
+    echo "WARNING: first GPU is '${GPU_NAME}', not A100. Continuing anyway."
+fi
+
+if [[ "${SKIP_INSTALL:-0}" != "1" ]]; then
+    echo "=== Installing repo and training dependencies ==="
+    "${PYTHON}" -m pip install -q --upgrade pip setuptools wheel
+    "${PYTHON}" -m pip install -q -e ".[train,test]" "huggingface_hub>=0.24"
+fi
+
+if [[ -n "${HF_TOKEN:-}" ]]; then
+    echo "=== Logging in to Hugging Face from HF_TOKEN ==="
+    "${PYTHON}" - <<'PY'
+import os
+from huggingface_hub import login
+
+login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
+print("Hugging Face token accepted.")
+PY
+else
+    echo "WARNING: HF_TOKEN is not set. This is okay only if the model is public or already cached."
+fi
+
+if [[ "${PREDOWNLOAD:-1}" == "1" && -z "${MODEL_PATH:-}" ]]; then
+    echo "=== Predownloading model: ${MODEL_NAME} ==="
+    MODEL_NAME="${MODEL_NAME}" "${PYTHON}" - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+
+model_name = os.environ["MODEL_NAME"]
+path = snapshot_download(
+    model_name,
+    ignore_patterns=["*.md", ".gitattributes"],
+)
+print(f"Cached model at: {path}")
+PY
+fi
+
+if [[ "${RUN_TESTS:-1}" == "1" ]]; then
+    echo "=== Running focused tests ==="
+    "${PYTHON}" -m pytest -p no:cacheprovider \
+        tests/test_old_policy.py \
+        tests/test_grpo_loss.py \
+        tests/test_sample_logging.py \
+        -q
+fi
+
+mkdir -p "$(dirname "${SAMPLE_LOG_PATH}")" checkpoints
+
+echo "=== Starting A100 training ==="
+echo "Full sample logs: ${SAMPLE_LOG_PATH}"
+echo "Tip: in another Colab cell, run: !tail -n 80 ${SAMPLE_LOG_PATH}"
+
+MODEL_NAME="${MODEL_NAME}" \
+MODEL_PATH="${MODEL_PATH:-}" \
+DATASET="${DATASET:-humaneval_mbpp_mix}" \
+MAX_PROMPTS="${MAX_PROMPTS:-500}" \
+STEPS="${STEPS:-100}" \
+GROUP_SIZE="${GROUP_SIZE:-4}" \
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-512}" \
+MAX_RESPONSE_TOKENS="${MAX_RESPONSE_TOKENS:-512}" \
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}" \
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-8}" \
+POISSON_MEAN="${POISSON_MEAN:-2}" \
+MAX_LOOPS="${MAX_LOOPS:-6}" \
+LEARNING_RATE="${LEARNING_RATE:-5e-4}" \
+SAVE_EVERY="${SAVE_EVERY:-50}" \
+EVAL_EVERY="${EVAL_EVERY:-25}" \
+LOG_EVERY="${LOG_EVERY:-1}" \
+SAMPLE_LOG_EVERY="${SAMPLE_LOG_EVERY:-1}" \
+SAMPLE_LOG_PROMPTS="${SAMPLE_LOG_PROMPTS:-1}" \
+SAMPLE_LOG_PATH="${SAMPLE_LOG_PATH}" \
+"${PYTHON}" - <<'PY'
+import os
+
+from scripts.train_srpo import SRPOTrainer, TrainConfig
+
+
+def int_env(name: str, default: int) -> int:
+    return int(os.environ.get(name, default))
+
+
+def float_env(name: str, default: float) -> float:
+    return float(os.environ.get(name, default))
+
+
+cfg = TrainConfig()
+cfg.model_name = os.environ["MODEL_NAME"]
+if os.environ.get("MODEL_PATH"):
+    cfg.model_path = os.environ["MODEL_PATH"]
+cfg.dataset = os.environ["DATASET"]
+cfg.max_prompts = int_env("MAX_PROMPTS", cfg.max_prompts)
+cfg.total_steps = int_env("STEPS", cfg.total_steps)
+cfg.group_size = int_env("GROUP_SIZE", cfg.group_size)
+cfg.max_prompt_tokens = int_env("MAX_PROMPT_TOKENS", cfg.max_prompt_tokens)
+cfg.max_response_tokens = int_env("MAX_RESPONSE_TOKENS", cfg.max_response_tokens)
+cfg.micro_batch_size = int_env("MICRO_BATCH_SIZE", cfg.micro_batch_size)
+cfg.gradient_accumulation_steps = int_env("GRAD_ACCUM_STEPS", cfg.gradient_accumulation_steps)
+cfg.poisson_mean = int_env("POISSON_MEAN", cfg.poisson_mean)
+cfg.max_loops = int_env("MAX_LOOPS", cfg.max_loops)
+cfg.learning_rate = float_env("LEARNING_RATE", cfg.learning_rate)
+cfg.save_every = int_env("SAVE_EVERY", cfg.save_every)
+cfg.eval_every = int_env("EVAL_EVERY", cfg.eval_every)
+cfg.log_every = int_env("LOG_EVERY", cfg.log_every)
+cfg.sample_log_every = int_env("SAMPLE_LOG_EVERY", cfg.sample_log_every)
+cfg.sample_log_prompts = int_env("SAMPLE_LOG_PROMPTS", cfg.sample_log_prompts)
+cfg.sample_log_path = os.environ["SAMPLE_LOG_PATH"]
+
+print("Training config:")
+for name in [
+    "model_name",
+    "model_path",
+    "dataset",
+    "max_prompts",
+    "total_steps",
+    "group_size",
+    "max_prompt_tokens",
+    "max_response_tokens",
+    "micro_batch_size",
+    "gradient_accumulation_steps",
+    "poisson_mean",
+    "max_loops",
+    "learning_rate",
+    "sample_log_every",
+    "sample_log_prompts",
+    "sample_log_path",
+]:
+    print(f"  {name}={getattr(cfg, name)}")
+
+trainer = SRPOTrainer(cfg)
+trainer.train()
+PY

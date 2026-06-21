@@ -43,18 +43,17 @@ class LTIInjection(nn.Module):
 
     def __init__(self, dim: int):
         super().__init__()
-        # log_A: learned vector → A_continuous = Diag(-exp(log_A))
-        # Initialized near zero so A_discrete starts close to identity
+        # log_A: learned vector -> A_continuous = Diag(-exp(log_A))
         self.log_A = nn.Parameter(torch.zeros(dim))
 
-        # log_dt: learned scalar step size → A_discrete = exp(dt * A_continuous)
-        # Initialized small so the model starts near the pretrained baseline
-        self.log_dt = nn.Parameter(torch.tensor(-3.0))
+        # log_dt: learned PER-DIMENSION step size -> A_discrete = exp(dt * A_continuous)
+        # Each dimension has its own time constant, allowing the model to learn
+        # which channels are more recurrent (small dt) vs feedforward (large dt)
+        self.log_dt = nn.Parameter(torch.full((dim,), -3.0))
 
         # B_raw: learned input injection matrix (full, not constrained)
-        # Euler discretization: B = dt * B_raw
-        # Initialized small so input injection starts negligible
-        self.B_raw = nn.Parameter(torch.randn(dim) * 0.01)
+        # Initialized at 2.0 for strong injection signal from step 0
+        self.B_raw = nn.Parameter(torch.randn(dim) * 2.0)
 
         # C: output projection (removed; unused, 14.7M dead params)
 
@@ -115,6 +114,7 @@ class LTIInjection(nn.Module):
         # by A·h and once by the residual I·h inside transformer_out.
         return (A - 1.0) * h + B * e_norm + transformer_out
 
-    def compute_spectral_radius(self) -> float:
+    def compute_spectral_radius(self) -> torch.Tensor:
         """Return ρ(A); must be < 1 for stability."""
-        return self.get_A().abs().max()
+        with torch.no_grad():
+            return self.get_A().abs().max()

@@ -318,7 +318,7 @@ class RecurrentDepthGemma(nn.Module):
             f"Recurrent: {len(self.recurrent_indices)}, "
             f"Coda: {len(self.coda_indices)}"
         )
-        print(f"Injection ρ(A) = {self.injection.compute_spectral_radius():.6f}")
+        print(f"Injection rho(A) = {self.injection.compute_spectral_radius():.6f}")
 
     def _compute_ple(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor) -> Optional[torch.Tensor]:
         """Compute Per-Layer Embeddings for E2B/E4B models.
@@ -524,7 +524,11 @@ class RecurrentDepthGemma(nn.Module):
 
         h = self.embed_tokens(input_ids)
         if position_ids is None:
-            position_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+            if attention_mask is not None:
+                position_ids = attention_mask.long().cumsum(dim=-1) - 1
+                position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+            else:
+                position_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
         pos_embeds = self._compute_position_embeddings(h, position_ids)
         causal_mask_mapping = {
             "full_attention": create_causal_mask(
@@ -672,6 +676,7 @@ class RecurrentDepthGemma(nn.Module):
         temperature: float = 0.7,
         top_k: int = 50,
         return_logprobs: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Autoregressive generation with full KV caching.
 
@@ -681,11 +686,23 @@ class RecurrentDepthGemma(nn.Module):
         """
         device = input_ids.device
         B, prompt_len = input_ids.shape
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, device=device)
+        else:
+            attention_mask = attention_mask.to(device)
+
+        prompt_lengths = attention_mask.long().sum(dim=-1)
+        if not torch.equal(prompt_lengths, torch.full_like(prompt_lengths, prompt_len)):
+            raise ValueError(
+                "RecurrentDepthGemma.generate expects unpadded input_ids. "
+                "Generate one prompt at a time, or pass sequences with equal "
+                "non-padding length."
+            )
 
         # Token 0: full forward + capture KV
         logits_full = self.forward(
             input_ids, n_loops=n_loops, return_logits=True,
-            return_kv_cache=True)
+            return_kv_cache=True, attention_mask=attention_mask)
         kv_all = self._steal_kv_cache()
 
         # Log-probs accumulator
@@ -705,11 +722,10 @@ class RecurrentDepthGemma(nn.Module):
 
         # Incremental generation
         gen_count = 1
-        pos_tensor = torch.arange(prompt_len, prompt_len + max_new_tokens, device=device)
         for _ in range(1, max_new_tokens):
             new_tok = all_ids[:, -1:]  # (B, 1)
-            gen_count += 1
-            pos_ids = pos_tensor[gen_count-1:gen_count].unsqueeze(0)
+            pos_value = prompt_len + gen_count - 1
+            pos_ids = torch.full((B, 1), pos_value, dtype=torch.long, device=device)
 
             h = self.embed_tokens(new_tok)
             pos_embeds = self._compute_position_embeddings(h, pos_ids)
@@ -762,6 +778,7 @@ class RecurrentDepthGemma(nn.Module):
             if return_logprobs:
                 token_lps.append(F.log_softmax(raw_logits, dim=-1).gather(-1, next_tok))
             all_ids = torch.cat([all_ids, next_tok], dim=1)
+            gen_count += 1
 
             if (next_tok == self._eos_id).all():
                 break

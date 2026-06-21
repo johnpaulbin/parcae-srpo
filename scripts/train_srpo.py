@@ -20,6 +20,7 @@ import os
 import sys
 import math
 import time
+import json
 import random
 import subprocess
 from dataclasses import dataclass, field
@@ -53,15 +54,16 @@ class TrainConfig:
     loop_embedding_dim: int = 128
 
     # ── Recurrent depth (Parcae) ──
-    poisson_mean: int = 2                  # μ_rec (lower for memory)
+    poisson_mean: int = 2                  # recurrent-depth sampling mean
     min_loops: int = 1
     max_loops: int = 8
-    bptt_ratio: float = 0.5                # μ_bwd = ceil(T * bptt_ratio)
+    bptt_ratio: float = 0.5                # bwd depth = ceil(T * bptt_ratio)
 
     # ── SRPO algorithm ──
-    group_size: int = 2                    # G completions per prompt
-    max_response_tokens: int = 64           # very short for memory
-    gen_temperature: float = 0.8
+    group_size: int = 4                    # G completions per prompt
+    max_prompt_tokens: int = 512
+    max_response_tokens: int = 512
+    gen_temperature: float = 1.2           # high enough to get mixed groups
     clip_epsilon: float = 0.2
     clip_epsilon_high: float = 0.28        # GSPO Clip-Higher
     kl_beta: float = 0.0
@@ -70,7 +72,7 @@ class TrainConfig:
     # ── Optimization ──
     micro_batch_size: int = 2              # prompts per micro-batch (per GPU)
     gradient_accumulation_steps: int = 4
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-4
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
 
@@ -79,10 +81,13 @@ class TrainConfig:
     save_every: int = 200
     eval_every: int = 50
     log_every: int = 10
+    sample_log_every: int = 10
+    sample_log_prompts: int = 1             # log all G completions for this many prompts
+    sample_log_path: str = "runs/samples.jsonl"
     seed: int = 42
 
     # ── Dataset ──
-    dataset: str = "mbpp"                  # mbpp | humaneval | bigcodebench | builtin
+    dataset: str = "humaneval_mbpp_mix"    # humaneval_mbpp_mix | mbpp | humaneval | bigcodebench | builtin
     max_prompts: int = 500
 
     # ── Distributed ──
@@ -124,14 +129,52 @@ class CodeProblemDataset:
                 ds = load_dataset("openai/openai_humaneval", split="test")
                 items = []
                 for item in ds:
+                    entry = item.get("entry_point", "solution")
+                    test = item.get("test", "")
+                    if "def check(" in test:
+                        test = f"{test}\ncheck({entry})"
                     items.append({
                         "prompt": item["prompt"],
-                        "test": "\n".join([f"assert {t}" for t in item.get("test", "").split("\n") if t.strip()]) if item.get("test") else "",
-                        "entry": item.get("entry_point", "solution"),
+                        "test": test,
+                        "entry": entry,
                     })
+            elif name in {"humaneval_mbpp_mix", "mix"}:
+                he = load_dataset("openai/openai_humaneval", split="test")
+                mbpp = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
+                he_items = [
+                    {
+                        "prompt": item["prompt"],
+                        "test": (
+                            f"{item.get('test', '')}\ncheck({item.get('entry_point', 'solution')})"
+                            if "def check(" in item.get("test", "")
+                            else item.get("test", "")
+                        ),
+                        "entry": item.get("entry_point", "solution"),
+                    }
+                    for item in he
+                ]
+                mbpp_items = []
+                for item in mbpp:
+                    tests = item["test_list"]
+                    test_str = "\n".join(tests)
+                    entry = tests[0].split("assert ")[1].split("(")[0] if tests else "solution"
+                    func_sig = item["code"].split("\n")[0]
+                    mbpp_items.append({
+                        "prompt": f"{item['prompt']}\n{func_sig}",
+                        "test": test_str,
+                        "entry": entry,
+                    })
+                rng = random.Random(self.cfg.seed)
+                rng.shuffle(he_items)
+                rng.shuffle(mbpp_items)
+                n_he = min(len(he_items), max(1, int(self.cfg.max_prompts * 0.8)))
+                n_mbpp = max(0, self.cfg.max_prompts - n_he)
+                items = he_items[:n_he] + mbpp_items[:n_mbpp]
             elif name == "bigcodebench":
                 ds = load_dataset("bigcode/bigcodebench", split="v0.1")
                 items = [{"prompt": i["prompt"], "test": i.get("test",""), "entry": i.get("entry_point","solution")} for i in ds]
+            elif name == "builtin":
+                return _builtin_problems(self.cfg.max_prompts)
             else:
                 raise ValueError(name)
 
@@ -263,7 +306,7 @@ def verify(code: str, test: str, timeout: float = 10.0) -> tuple[float, str]:
     script_lines.append("    traceback.print_exc()")
     full_script = "\n".join(script_lines)
     try:
-        r = subprocess.run(["python3", "-c", full_script], capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run([sys.executable, "-I", "-c", full_script], capture_output=True, text=True, timeout=timeout)
         out = r.stdout + r.stderr
         if "__ALL_PASSED__" in out:
             return 1.0, "All tests passed."
@@ -283,6 +326,7 @@ def grpo_loss(
     response_mask: torch.Tensor,     # (B, L)
     epsilon: float,
     epsilon_high: float,
+    group_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     GRPO branch: sequence-level group-relative advantage.  One scalar
@@ -300,10 +344,25 @@ def grpo_loss(
     seq_lp = (log_probs * response_mask).sum(dim=-1) / n_tokens
     seq_lp_old = (log_probs_old * response_mask).sum(dim=-1) / n_tokens
 
-    # group-relative advantage
-    mu = rewards.mean()
-    sigma = rewards.std() + 1e-8
-    A = (rewards - mu) / sigma                                    # (B,)
+    # group-relative advantage.  Binary rewards must include failed and
+    # successful completions from the same prompt; otherwise all-correct
+    # subsets collapse to zero advantage.
+    if group_ids is None:
+        sigma = rewards.std(unbiased=False)
+        A = (rewards - rewards.mean()) / (sigma + 1e-8)
+        if sigma < 1e-8:
+            A = torch.zeros_like(rewards)
+    else:
+        A = torch.zeros_like(rewards)
+        for gid in torch.unique(group_ids):
+            mask = group_ids == gid
+            if mask.sum() < 2:
+                continue
+            group_rewards = rewards[mask]
+            sigma = group_rewards.std(unbiased=False)
+            if sigma < 1e-8:
+                continue
+            A[mask] = (group_rewards - group_rewards.mean()) / (sigma + 1e-8)
 
     # sequence-level importance ratio (length-normalized)
     rho = torch.exp(seq_lp - seq_lp_old)                          # (B,)
@@ -394,12 +453,27 @@ class SRPOTrainer:
 
         self._seed()
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_path or cfg.model_name)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self._build_model()
         self._build_optimizer()
         self.dataset = CodeProblemDataset(cfg)
         self.dataloader = DataLoader(self.dataset, batch_size=cfg.micro_batch_size, shuffle=True, collate_fn=lambda x: list(x))
         self.scaler = torch.amp.GradScaler('cuda')
         self.step = 0
+
+    def _format_prompt(self, prompt: str) -> str:
+        """Apply the model chat template when available."""
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                return self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                pass
+        return prompt
 
     def _seed(self):
         torch.manual_seed(self.cfg.seed + self.local_rank)
@@ -418,11 +492,6 @@ class SRPOTrainer:
             use_loop_embedding=True,
             loop_embedding_dim=self.cfg.loop_embedding_dim,
         )
-        if self.cfg.model_path is None:
-            from huggingface_hub import snapshot_download
-            rd.model_path = snapshot_download(
-                self.cfg.model_name, cache_dir="/tmp/hf-cache",
-                ignore_patterns=["*.md", ".gitattributes"])
         self.model = RecurrentDepthGemma(rd)
         self.model.load_pretrained()
         self.model.to(self.device)
@@ -460,7 +529,7 @@ class SRPOTrainer:
             self.model = DDP(
                 self.model,
                 device_ids=[self.local_rank],
-                find_unused_parameters=True
+                find_unused_parameters=False
             )
             self._model_unwrapped = self.model.module
         else:
@@ -491,41 +560,43 @@ class SRPOTrainer:
 
     @torch.no_grad()
     def _generate(self, prompts: list[str], T: int) -> list[dict]:
-        """Generate G completions per prompt, batched across prompts.
+        """Generate G completions per prompt.
 
-        Calls generate() with return_logprobs=True. Single forward pass
-        per batch, no separate log-prob extraction pass.
+        Generation is intentionally per prompt in the pure PyTorch path.  The
+        recurrent KV implementation expects unpadded inputs; batching prompts
+        of different lengths would otherwise train on pad-token context.
         """
         self._model_unwrapped._bptt_depth = None
         results = []
         G = self.cfg.group_size
 
-        # Tokenize all prompts together
-        enc = self.tokenizer(prompts, return_tensors="pt", padding=True,
-                             truncation=True, max_length=512).to(self.device)
-        prompt_ids = enc["input_ids"]
-        attn_mask = enc["attention_mask"]
-        B = len(prompts)
+        for b, prompt in enumerate(prompts):
+            enc = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.cfg.max_prompt_tokens,
+            ).to(self.device)
+            prompt_ids = enc["input_ids"]
+            prompt_len = prompt_ids.shape[1]
 
-        # Generate G completions per prompt
-        for g in range(G):
-            gen_out = self._model_unwrapped.generate(
-                input_ids=prompt_ids,
-                max_new_tokens=self.cfg.max_response_tokens,
-                n_loops=T,
-                temperature=self.cfg.gen_temperature,
-                top_k=50,
-                return_logprobs=True,
-            )
-            if isinstance(gen_out, tuple):
-                full_ids, token_lps_batch = gen_out
-            else:
-                full_ids = gen_out
-                token_lps_batch = None
+            for _ in range(G):
+                gen_out = self._model_unwrapped.generate(
+                    input_ids=prompt_ids,
+                    max_new_tokens=self.cfg.max_response_tokens,
+                    n_loops=T,
+                    temperature=self.cfg.gen_temperature,
+                    top_k=50,
+                    return_logprobs=True,
+                )
+                if isinstance(gen_out, tuple):
+                    full_ids, token_lps_batch = gen_out
+                else:
+                    full_ids = gen_out
+                    token_lps_batch = None
 
-            for b in range(B):
-                pl = attn_mask[b].sum().item()
-                ids = full_ids[b]
+                pl = prompt_len
+                ids = full_ids[0]
                 L = ids.shape[0]
                 eos_mask = (ids[pl:] == self.tokenizer.eos_token_id)
                 if eos_mask.any():
@@ -539,7 +610,7 @@ class SRPOTrainer:
 
                 if token_lps_batch is not None:
                     gen_len = min(L - pl, token_lps_batch.shape[1])
-                    token_lp = token_lps_batch[b, :gen_len]
+                    token_lp = token_lps_batch[0, :gen_len]
                 else:
                     token_lp = torch.zeros(0, device=self.device)
 
@@ -549,14 +620,16 @@ class SRPOTrainer:
                     "token_lp": token_lp,
                     "resp_mask": resp_mask,
                     "prompt_len": pl,
+                    "batch_idx": b,
                 })
         return results
 
     def train_step(self, batch: list[dict]) -> dict:
         cfg = self.cfg
         G = cfg.group_size
-        prompts = [b["prompt"] for b in batch]
-        B = len(prompts)
+        raw_prompts = [b["prompt"] for b in batch]
+        prompts = [self._format_prompt(p) for p in raw_prompts]
+        B = len(raw_prompts)
 
         # sample depth
         T = max(cfg.min_loops, min(cfg.max_loops, np.random.poisson(cfg.poisson_mean)))
@@ -572,19 +645,18 @@ class SRPOTrainer:
         if self.local_rank == 0:
             print(f"  [generate] T={T}, prompts={B}, G={G}...", flush=True)
         comps = self._generate(prompts, T)   # list of B*G dicts
-        # Free GPU memory: move full_ids to CPU, drop token_lp (used only in GRPO branch)
+        # Free GPU memory. Current-policy GRPO logprobs are recomputed with grad.
         for c in comps:
             c["full_ids"] = c["full_ids"].cpu()
 
         # verify
-        for i, c in enumerate(comps):
-            b = i // G
+        for c in comps:
+            b = c["batch_idx"]
             prob = batch[b]
             code = extract_code(c["text"])
             reward, fb = verify(code, prob["test"])
             c["reward"] = reward
             c["feedback"] = fb
-            c["batch_idx"] = b
 
         # ── build per‑prompt correct demonstrations ──
         correct_by_prompt = {b: [] for b in range(B)}
@@ -595,98 +667,162 @@ class SRPOTrainer:
         for c in comps:
             if c["reward"] <= 0:
                 demos = correct_by_prompt[c["batch_idx"]]
-                c["sdpo_feedback"] = build_feedback(c["text"], c["feedback"], prompts[c["batch_idx"]], demos)
+                c["sdpo_feedback"] = build_feedback(c["text"], c["feedback"], raw_prompts[c["batch_idx"]], demos)
 
-        # --- GRPO branch: correct samples (batched) ---
+        samples = self._collect_samples(raw_prompts, prompts, comps)
+
+        # --- GRPO branch: all samples, grouped by prompt ---
         correct = [c for c in comps if c["reward"] > 0]
         grpo_l = torch.tensor(0.0, device=self.device)
-        if len(correct) >= 2:
-            # Pad all correct completions to uniform length
-            L_max = max(c["full_ids"].shape[0] for c in correct)
-            batch_ids = torch.zeros(len(correct), L_max, dtype=torch.long, device=self.device)
-            batch_mask = torch.zeros(len(correct), L_max, device=self.device)
-            for j, c in enumerate(correct):
+        policy_samples = comps
+        if len(policy_samples) >= 2:
+            L_max = max(c["full_ids"].shape[0] for c in policy_samples)
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = self.tokenizer.eos_token_id or 0
+            batch_ids = torch.full(
+                (len(policy_samples), L_max),
+                pad_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+            batch_attn = torch.zeros(len(policy_samples), L_max, dtype=torch.long, device=self.device)
+            batch_mask = torch.zeros(len(policy_samples), L_max, device=self.device)
+            for j, c in enumerate(policy_samples):
                 L = c["full_ids"].shape[0]
                 PL = c["prompt_len"]
                 batch_ids[j, :L] = c["full_ids"].to(self.device)
-                batch_mask[j, PL:] = 1
-            rwd = torch.tensor([c["reward"] for c in correct], device=self.device)
+                batch_attn[j, :L] = 1
+                batch_mask[j, PL:L] = 1
+            rwd = torch.tensor([c["reward"] for c in policy_samples], device=self.device)
+            group_ids = torch.tensor([c["batch_idx"] for c in policy_samples], device=self.device)
 
-            # Current log-probs: already cached from _generate (no extra forward)
-            lp = torch.zeros(len(correct), L_max, device=self.device)
-            for j, c in enumerate(correct):
+            # Current-policy log-probs must be recomputed with grad.  The
+            # generation-time logprobs are under no_grad and cannot train GRPO.
+            logits_cur = self.model(
+                input_ids=batch_ids,
+                attention_mask=batch_attn,
+                n_loops=T,
+                return_logits=True,
+            )
+            log_probs_cur = F.log_softmax(logits_cur.float(), dim=-1).to(logits_cur.dtype)
+            lp = torch.zeros(len(policy_samples), L_max, device=self.device, dtype=log_probs_cur.dtype)
+            for j, c in enumerate(policy_samples):
                 L = c["full_ids"].shape[0]
                 PL = c["prompt_len"]
-                lp[j, PL:L] = c["token_lp"][:L - PL]
+                if L > PL:
+                    gen_pos = torch.arange(PL, L, device=self.device)
+                    lp[j, PL:L] = log_probs_cur[j, gen_pos - 1, batch_ids[j, gen_pos]]
 
             # Old-policy log-probs: forward with old-policy modules swapped in.
             # Uses context manager to guarantee restoration even on exception.
             with self._old_policy_ctx():
                 with torch.no_grad():
                     logits_old = self._model_unwrapped.forward(
-                        input_ids=batch_ids, n_loops=T, return_logits=True)
+                        input_ids=batch_ids,
+                        attention_mask=batch_attn,
+                        n_loops=T,
+                        return_logits=True,
+                    )
             log_probs_old = F.log_softmax(logits_old.float(), dim=-1).to(logits_old.dtype)
-            lp_old = torch.zeros(len(correct), L_max, device=self.device)
-            for j, c in enumerate(correct):
+            lp_old = torch.zeros(len(policy_samples), L_max, device=self.device, dtype=log_probs_old.dtype)
+            for j, c in enumerate(policy_samples):
                 L = c["full_ids"].shape[0]
                 PL = c["prompt_len"]
-                gen_pos = torch.arange(PL, L, device=self.device)
-                lp_old[j, PL:L] = log_probs_old[j, gen_pos - 1, batch_ids[j, gen_pos]]
+                if L > PL:
+                    gen_pos = torch.arange(PL, L, device=self.device)
+                    lp_old[j, PL:L] = log_probs_old[j, gen_pos - 1, batch_ids[j, gen_pos]]
 
-            grpo_l = grpo_loss(lp, lp_old, rwd, batch_mask, cfg.clip_epsilon, cfg.clip_epsilon_high)
+            grpo_l = grpo_loss(
+                lp,
+                lp_old,
+                rwd,
+                batch_mask,
+                cfg.clip_epsilon,
+                cfg.clip_epsilon_high,
+                group_ids=group_ids,
+            )
 
         # --- SDPO branch: failed samples (batched) ---
         failed = [c for c in comps if c["reward"] <= 0 and c.get("sdpo_feedback")]
         sdpo_l = torch.tensor(0.0, device=self.device)
         if failed:
             teacher_prompts = [
-                f + "\n\nNow write the corrected code for:\n" + prompts[c["batch_idx"]]
+                self._format_prompt(f + "\n\nNow write the corrected code for:\n" + raw_prompts[c["batch_idx"]])
                 for c, f in [(c, c["sdpo_feedback"]) for c in failed]
             ]
-            tp_enc = self.tokenizer(
-                teacher_prompts, return_tensors="pt", truncation=True,
-                max_length=512, padding=True).to(self.device)
-            tp_lens = tp_enc["attention_mask"].sum(dim=-1).long()
-
-            # Teacher generates batched (old policy, no grad).
-            # Tokenization above is on CPU path: feedback text varies per
-            # step. Acceptable for research (20 prompts, G=2). Production
-            # would pre-tokenize or use async pipeline.
+            # Teacher generates per prompt (old policy, no grad).  The pure
+            # PyTorch recurrent generator expects unpadded prompts.
             # _old_policy_ctx is a zero-copy reference swap on the unwrapped
             # model (see definition at _old_policy_ctx). No state_dict copy,
             # no CUDA sync. Old-policy weights stored in same dtype (bf16)
             # as active model via load_state_dict in _snapshot_old_policy.
+            teacher_ids = []
+            tp_lens = []
             with self._old_policy_ctx():
                 with torch.no_grad():
-                    teacher_gen = self._model_unwrapped.generate(
-                        input_ids=tp_enc["input_ids"],
-                        max_new_tokens=self.cfg.max_response_tokens,
-                        n_loops=T,
-                        temperature=0.6,
-                        top_k=50,
-                    )
-            teacher_full_ids = teacher_gen
-            TL = teacher_full_ids.shape[1]
+                    for teacher_prompt in teacher_prompts:
+                        tp_enc = self.tokenizer(
+                            teacher_prompt,
+                            return_tensors="pt",
+                            truncation=True,
+                            max_length=self.cfg.max_prompt_tokens,
+                        ).to(self.device)
+                        teacher_gen = self._model_unwrapped.generate(
+                            input_ids=tp_enc["input_ids"],
+                            max_new_tokens=self.cfg.max_response_tokens,
+                            n_loops=T,
+                            temperature=0.6,
+                            top_k=50,
+                        )
+                        teacher_ids.append(teacher_gen[0])
+                        tp_lens.append(tp_enc["input_ids"].shape[1])
+
+            TL = max(ids.shape[0] for ids in teacher_ids)
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = self.tokenizer.eos_token_id or 0
+            teacher_full_ids = torch.full(
+                (len(teacher_ids), TL),
+                pad_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+            teacher_attn = torch.zeros(len(teacher_ids), TL, dtype=torch.long, device=self.device)
+            for j, ids in enumerate(teacher_ids):
+                L = ids.shape[0]
+                teacher_full_ids[j, :L] = ids.to(self.device)
+                teacher_attn[j, :L] = 1
 
             # Student: current policy (DDP, grad enabled)
-            stu_logits = self.model.forward(
-                input_ids=teacher_full_ids, n_loops=T, return_logits=True)
+            stu_logits = self.model(
+                input_ids=teacher_full_ids,
+                attention_mask=teacher_attn,
+                n_loops=T,
+                return_logits=True,
+            )
             # Teacher: old policy forward (no grad)
             with self._old_policy_ctx():
                 with torch.no_grad():
                     tea_logits = self._model_unwrapped.forward(
-                        input_ids=teacher_full_ids, n_loops=T, return_logits=True)
+                        input_ids=teacher_full_ids,
+                        attention_mask=teacher_attn,
+                        n_loops=T,
+                        return_logits=True,
+                    )
 
             # Batched response mask: (B, TL) where B = len(failed)
             resp_mask = torch.zeros(len(failed), TL, device=self.device)
             for j, pl in enumerate(tp_lens):
-                resp_mask[j, pl.item():] = 1
+                resp_mask[j, pl:teacher_attn[j].sum().item()] = 1
 
             # Compute SDPO loss over entire batch (vectorized)
             sdpo_l = sdpo_loss(
                 stu_logits, tea_logits, resp_mask, cfg.entropy_weight)
 
         total_loss = grpo_l + sdpo_l
+        if not total_loss.requires_grad:
+            total_loss = sum(p.sum() * 0.0 for p in self.trainable_params())
         # Loss returned to caller for gradient accumulation.
         # Backward is called in train() after accumulating over micro-batches.
 
@@ -698,11 +834,106 @@ class SRPOTrainer:
             "reward_mean": sum(c["reward"] for c in comps) / len(comps) if comps else 0,
             "T": T,
             "T_bwd": T_bwd,
-            "rho": self._model_unwrapped.injection.compute_spectral_radius(),
+            "rho": float(self._model_unwrapped.injection.compute_spectral_radius().detach().item()),
             "n_correct": len(correct),
             "n_failed": len(failed),
+            "samples": samples,
         }
         return metrics
+
+    def _collect_samples(
+        self,
+        raw_prompts: list[str],
+        model_prompts: list[str],
+        completions: list[dict],
+    ) -> list[dict]:
+        """Collect full, untruncated text samples for progress logging."""
+        n_prompts = max(0, self.cfg.sample_log_prompts)
+        if n_prompts == 0:
+            return []
+
+        prompt_ids = []
+        for c in completions:
+            batch_idx = c["batch_idx"]
+            if batch_idx not in prompt_ids:
+                if len(prompt_ids) >= n_prompts:
+                    break
+                prompt_ids.append(batch_idx)
+
+        completion_counts: dict[int, int] = {}
+        samples = []
+        for c in completions:
+            batch_idx = c["batch_idx"]
+            completion_idx = completion_counts.get(batch_idx, 0)
+            completion_counts[batch_idx] = completion_idx + 1
+            if batch_idx not in prompt_ids:
+                continue
+            samples.append({
+                "prompt_index": batch_idx,
+                "completion_index": completion_idx,
+                "prompt": raw_prompts[batch_idx],
+                "model_prompt": model_prompts[batch_idx],
+                "completion": c["text"],
+                "reward": int(c.get("reward", 0)),
+                "feedback": c.get("feedback", ""),
+            })
+        return samples
+
+    def _log_samples(self, step_idx: int, metrics: dict):
+        """Print and persist full prompt/completion text without truncation."""
+        samples = metrics.get("samples") or []
+        if not samples:
+            return
+
+        log_path = self.cfg.sample_log_path
+        if log_path:
+            log_dir = os.path.dirname(log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                for sample in samples:
+                    record = {
+                        "step": step_idx,
+                        "T": metrics.get("T"),
+                        "loss": metrics.get("loss"),
+                        "grpo_loss": metrics.get("grpo_loss"),
+                        "sdpo_loss": metrics.get("sdpo_loss"),
+                        "reward_mean": metrics.get("reward_mean"),
+                        "n_correct": metrics.get("n_correct"),
+                        "n_failed": metrics.get("n_failed"),
+                        "rho": metrics.get("rho"),
+                        **sample,
+                    }
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        for sample in samples:
+            loss_bits = (
+                f"loss={metrics.get('loss', 0):.4f} "
+                f"grpo={metrics.get('grpo_loss', 0):.4f} "
+                f"sdpo={metrics.get('sdpo_loss', 0):.4f} "
+                f"R_mean={metrics.get('reward_mean', 0):.4f}"
+            )
+            print(
+                "\n".join([
+                    "",
+                    (
+                        f"[sample step={step_idx} T={metrics.get('T')} "
+                        f"prompt={sample['prompt_index']} "
+                        f"completion={sample['completion_index']} "
+                        f"reward={sample['reward']} {loss_bits}]"
+                    ),
+                    "--- PROMPT ---",
+                    sample["prompt"],
+                    "--- MODEL PROMPT (CHAT TEMPLATE APPLIED) ---",
+                    sample["model_prompt"],
+                    "--- MODEL COMPLETION ---",
+                    sample["completion"],
+                    "--- VERIFIER FEEDBACK ---",
+                    sample["feedback"],
+                    "--- END SAMPLE ---",
+                ]),
+                flush=True,
+            )
 
     def _snapshot_old_policy(self):
         """Copy current trainable params into old-policy modules."""
@@ -767,7 +998,7 @@ class SRPOTrainer:
                 with sync_ctx:
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                         metrics = self.train_step(list(batch))
-                self.scaler.scale(metrics["total_loss"] / cfg.gradient_accumulation_steps).backward()
+                    self.scaler.scale(metrics["total_loss"] / cfg.gradient_accumulation_steps).backward()
 
             # optimizer step
             self.scaler.unscale_(self.optimizer)
@@ -793,6 +1024,12 @@ class SRPOTrainer:
                     f"ρ(A)={metrics['rho']:.4f} | "
                     f"{dt:.1f}s"
                 )
+
+            sample_due = cfg.sample_log_every > 0 and (
+                step_idx % cfg.sample_log_every == 0 or step_idx < 5
+            )
+            if self.local_rank == 0 and sample_due:
+                self._log_samples(step_idx, metrics)
 
             # eval
             if step_idx % cfg.eval_every == 0 and step_idx > 0:
@@ -868,15 +1105,52 @@ def main():
                     help="Path to checkpoint to resume from")
     ap.add_argument("--steps", type=int, default=None,
                     help="Override total_steps")
+    ap.add_argument("--sample-log-every", type=int, default=None,
+                    help="Log full prompt/completion samples every N steps")
+    ap.add_argument("--sample-log-prompts", type=int, default=None,
+                    help="Number of prompt groups to log; each group logs all G completions")
+    ap.add_argument("--sample-log-path", type=str, default=None,
+                    help="JSONL path for full prompt/completion sample logs")
+    ap.add_argument("--no-sample-log", action="store_true",
+                    help="Disable full prompt/completion sample logging")
     args = ap.parse_args()
 
-    if args.resume:
-        cfg = TrainConfig()
+    def apply_overrides(cfg: TrainConfig) -> bool:
+        changed = False
         if args.steps is not None:
             cfg.total_steps = args.steps
+            changed = True
+        if args.sample_log_every is not None:
+            cfg.sample_log_every = args.sample_log_every
+            changed = True
+        if args.sample_log_prompts is not None:
+            cfg.sample_log_prompts = args.sample_log_prompts
+            changed = True
+        if args.sample_log_path is not None:
+            cfg.sample_log_path = args.sample_log_path
+            changed = True
+        if args.no_sample_log:
+            cfg.sample_log_every = 0
+            changed = True
+        return changed
+
+    if args.resume:
+        cfg = None
+        if any([
+            args.steps is not None,
+            args.sample_log_every is not None,
+            args.sample_log_prompts is not None,
+            args.sample_log_path is not None,
+            args.no_sample_log,
+        ]):
+            ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+            cfg = ckpt["config"]
+            apply_overrides(cfg)
+            del ckpt
         trainer = SRPOTrainer.resume(args.resume, cfg_override=cfg)
     else:
         cfg = TrainConfig()
+        apply_overrides(cfg)
         trainer = SRPOTrainer(cfg)
     trainer.train()
 
