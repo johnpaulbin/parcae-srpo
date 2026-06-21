@@ -31,7 +31,7 @@ With T=3: effective depth = 16 + 16×3 + 16 = 80 layers
 With T=6: effective depth = 16 + 16×6 + 16 = 128 layers
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 import collections
 import warnings
@@ -39,6 +39,7 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.models.gemma4.modeling_gemma4 import create_causal_mask, create_sliding_window_causal_mask
 # Support both gemma4 (E2B/E4B/31B) and gemma4_unified (12B)
@@ -52,6 +53,25 @@ except ImportError:
     _HAS_UNIFIED = False
 
 from .injection import LTIInjection
+
+
+def _resolve_module_path(root, path: str):
+    """Resolve a dotted module path, returning None if any segment is missing."""
+    node = root
+    for part in path.split("."):
+        if not hasattr(node, part):
+            return None
+        node = getattr(node, part)
+    return node
+
+
+def _find_first_module_path(root, paths: list[str]):
+    """Return the first existing module path and value from a wrapper object."""
+    for path in paths:
+        value = _resolve_module_path(root, path)
+        if value is not None:
+            return path, value
+    return None, None
 
 
 def _layer_forward(layer, hidden_states, per_layer_input, shared_kv_states,
@@ -81,6 +101,10 @@ class RecurrentDepthConfig:
 
     # Path to the pretrained Gemma 4 model
     model_path: str = "google/gemma-4-E2B-it"
+    load_backend: str = "transformers"     # transformers | unsloth
+    load_in_4bit: bool = False             # used by the Unsloth backend
+    max_seq_length: int = 2048             # Unsloth rope/cache setup length
+    fast_inference: bool = False           # leave False for training memory
 
     # Layer split must sum to model's total (e.g., 12+11+12=35 for E2B)
     prelude_layers: int = 12
@@ -99,6 +123,10 @@ class RecurrentDepthConfig:
     # at each iteration (distinguishes early from late loop passes)
     use_loop_embedding: bool = True
     loop_embedding_dim: int = 256  # channels receiving the loop signal
+
+    # Recompute frozen backbone activations during backward. This is essential
+    # when the recurrent block is looped several times on a single A100.
+    use_activation_checkpointing: bool = True
 
 
 class LoopEmbedding(nn.Module):
@@ -264,15 +292,91 @@ class RecurrentDepthGemma(nn.Module):
         After loading, the HF model object is deleted to free memory.
         """
         print(f"Loading pretrained model from {self.cfg.model_path}...")
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            self.cfg.model_path,
-            dtype=torch.bfloat16,
-            device_map="cpu",
-            low_cpu_mem_usage=True,
-        )
+        backend = self.cfg.load_backend.lower()
+        def _load_transformers(load_in_4bit: bool):
+            kwargs = {
+                "torch_dtype": torch.bfloat16,
+                "low_cpu_mem_usage": True,
+            }
+            if load_in_4bit:
+                from transformers import BitsAndBytesConfig
 
-        # Gemma 4 structure: model.model.language_model contains layers/embed/norm
-        language_model = hf_model.model.language_model
+                kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                )
+                kwargs["device_map"] = "auto"
+            else:
+                kwargs["device_map"] = "cpu"
+            return AutoModelForCausalLM.from_pretrained(self.cfg.model_path, **kwargs)
+
+        if backend == "transformers":
+            hf_model = _load_transformers(self.cfg.load_in_4bit)
+            self._quantized_backbone = bool(self.cfg.load_in_4bit)
+        elif backend == "unsloth":
+            try:
+                from unsloth import FastLanguageModel
+            except ImportError as exc:
+                raise ImportError(
+                    "The Unsloth backend requires `pip install -e .[unsloth]` "
+                    "or `pip install unsloth`."
+                ) from exc
+            try:
+                hf_model, _tokenizer = FastLanguageModel.from_pretrained(
+                    model_name=self.cfg.model_path,
+                    max_seq_length=self.cfg.max_seq_length,
+                    dtype=None,
+                    load_in_4bit=self.cfg.load_in_4bit,
+                    fast_inference=self.cfg.fast_inference,
+                )
+                self._quantized_backbone = bool(self.cfg.load_in_4bit)
+            except Exception as exc:
+                if not self.cfg.load_in_4bit:
+                    raise
+                warnings.warn(
+                    "Unsloth loading failed; falling back to Transformers "
+                    f"bitsandbytes 4-bit loading. Original error: {exc}",
+                    RuntimeWarning,
+                )
+                hf_model = _load_transformers(load_in_4bit=True)
+                backend = "transformers-bnb"
+                self._quantized_backbone = True
+        else:
+            raise ValueError(
+                f"Unknown load_backend={self.cfg.load_backend!r}; "
+                "expected 'transformers' or 'unsloth'."
+            )
+
+        # Gemma 4 is nested differently by raw HF, PEFT, and Unsloth wrappers.
+        lm_path, language_model = _find_first_module_path(
+            hf_model,
+            [
+                "model.language_model",
+                "model.model.language_model",
+                "base_model.model.model.language_model",
+                "base_model.model.language_model",
+                "base_model.model.model.model.language_model",
+            ],
+        )
+        if language_model is None:
+            base_getter = getattr(hf_model, "get_base_model", None)
+            if callable(base_getter):
+                base_model = base_getter()
+                lm_path, language_model = _find_first_module_path(
+                    base_model,
+                    [
+                        "model.language_model",
+                        "model.model.language_model",
+                        "language_model",
+                    ],
+                )
+        if language_model is None:
+            raise AttributeError(
+                "Could not locate the Gemma 4 language_model inside the "
+                f"{self.cfg.load_backend} model wrapper."
+            )
 
         # Extract layers
         for idx in range(self.num_layers):
@@ -281,13 +385,31 @@ class RecurrentDepthGemma(nn.Module):
         # Extract non-layer components
         self.embed_tokens = language_model.embed_tokens
         self.norm = language_model.norm
-        self.lm_head = hf_model.lm_head
+        _head_path, lm_head = _find_first_module_path(
+            hf_model,
+            [
+                "lm_head",
+                "base_model.model.lm_head",
+                "base_model.model.model.lm_head",
+            ],
+        )
+        if lm_head is None:
+            raise AttributeError("Could not locate lm_head on the loaded model.")
+        self.lm_head = lm_head
         self.rotary_emb = language_model.rotary_emb
         self._language_model = language_model  # keep for PLE methods
 
         # Vision/audio embedders; keep for multimodal inputs
-        self.embed_vision = hf_model.model.embed_vision
-        self.embed_audio = hf_model.model.embed_audio
+        _container_path, model_container = _find_first_module_path(
+            hf_model,
+            [
+                "model",
+                "base_model.model.model",
+                "base_model.model",
+            ],
+        )
+        self.embed_vision = getattr(model_container, "embed_vision", None)
+        self.embed_audio = getattr(model_container, "embed_audio", None)
 
         # Move all layers to CPU (they were loaded there)
         # The trainer will call model.to(device) to move them to GPU
@@ -318,7 +440,25 @@ class RecurrentDepthGemma(nn.Module):
             f"Recurrent: {len(self.recurrent_indices)}, "
             f"Coda: {len(self.coda_indices)}"
         )
+        if backend == "unsloth":
+            print(
+                f"Unsloth backend active. language_model={lm_path}, "
+                f"load_in_4bit={self.cfg.load_in_4bit}"
+            )
         print(f"Injection rho(A) = {self.injection.compute_spectral_radius():.6f}")
+
+    @property
+    def quantized_backbone(self) -> bool:
+        return bool(getattr(self, "_quantized_backbone", False))
+
+    def move_trainable_modules(self, device: torch.device | str):
+        """Move new SRPO modules when a quantized backbone cannot use .to()."""
+        self.injection.to(device)
+        self.intermediate_norm.to(device)
+        if self.loop_embed is not None:
+            self.loop_embed.to(device)
+        if self.depth_lora is not None:
+            self.depth_lora.to(device)
 
     def _compute_ple(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor) -> Optional[torch.Tensor]:
         """Compute Per-Layer Embeddings for E2B/E4B models.
@@ -391,7 +531,7 @@ class RecurrentDepthGemma(nn.Module):
                     _layer_forward, layer, h, ple, shared_kv_states,
                     position_embeddings[layer_type], layer_mask, position_ids,
                     return_kv_cache,
-                    use_reentrant=True,
+                    use_reentrant=False,
                 )
             else:
                 layer_out = layer(
@@ -544,11 +684,17 @@ class RecurrentDepthGemma(nn.Module):
         per_layer_inputs = None
         if hasattr(self, "_ple_enabled") and self._ple_enabled:
             per_layer_inputs = self._compute_ple(input_ids, h)
+        use_checkpoint = (
+            self.cfg.use_activation_checkpointing
+            and torch.is_grad_enabled()
+            and not return_kv_cache
+        )
 
         prelude_out = self._run_block(
             h, self.prelude_indices, pos_embeds, causal_mask_mapping,
             position_ids, shared_kv_states=shared_kv_states,
             per_layer_inputs=per_layer_inputs,
+            use_checkpoint=use_checkpoint,
             return_kv_cache=return_kv_cache)
         h = prelude_out[0] if isinstance(prelude_out, tuple) else prelude_out
         e = h.clone().detach()
@@ -559,7 +705,7 @@ class RecurrentDepthGemma(nn.Module):
                 causal_mask_mapping, position_ids,
                 shared_kv_states=shared_kv_states,
                 per_layer_inputs=per_layer_inputs,
-                use_checkpoint=False,
+                use_checkpoint=use_checkpoint,
                 return_kv_cache=return_kv_cache)
 
         h, kv_rec, thoughts = self._recurrent_loop(
@@ -571,6 +717,7 @@ class RecurrentDepthGemma(nn.Module):
             h, self.coda_indices, pos_embeds, causal_mask_mapping,
             position_ids, shared_kv_states=shared_kv_states,
             per_layer_inputs=per_layer_inputs,
+            use_checkpoint=use_checkpoint,
             return_kv_cache=return_kv_cache)
         h = coda_out[0] if isinstance(coda_out, tuple) else coda_out
         return h, kv_rec, thoughts

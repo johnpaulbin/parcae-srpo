@@ -52,6 +52,11 @@ class TrainConfig:
     coda_layers: int = 12
     lora_rank: int = 16
     loop_embedding_dim: int = 128
+    load_backend: str = "transformers"     # transformers | unsloth
+    load_in_4bit: bool = False
+    max_seq_length: int = 2048
+    fast_inference: bool = False
+    use_activation_checkpointing: bool = True
 
     # ── Recurrent depth (Parcae) ──
     poisson_mean: int = 2                  # recurrent-depth sampling mean
@@ -70,6 +75,7 @@ class TrainConfig:
     entropy_weight: float = 0.01           # SRPO entropy-aware weighting
     grpo_forward_batch_size: int = 1       # memory guard for long code outputs
     sdpo_forward_batch_size: int = 1       # memory guard for teacher-correction KL
+    max_train_sequence_tokens: int = 0     # 0 = train on full generated sequence
 
     # ── Optimization ──
     micro_batch_size: int = 2              # prompts per micro-batch (per GPU)
@@ -491,6 +497,10 @@ class SRPOTrainer:
     def _build_model(self):
         rd = RecurrentDepthConfig(
             model_path=self.cfg.model_path or self.cfg.model_name,
+            load_backend=self.cfg.load_backend,
+            load_in_4bit=self.cfg.load_in_4bit,
+            max_seq_length=self.cfg.max_seq_length,
+            fast_inference=self.cfg.fast_inference,
             prelude_layers=self.cfg.prelude_layers,
             n_recurrent_layers=self.cfg.n_recurrent_layers,
             coda_layers=self.cfg.coda_layers,
@@ -499,10 +509,14 @@ class SRPOTrainer:
             lora_rank=self.cfg.lora_rank,
             use_loop_embedding=True,
             loop_embedding_dim=self.cfg.loop_embedding_dim,
+            use_activation_checkpointing=self.cfg.use_activation_checkpointing,
         )
         self.model = RecurrentDepthGemma(rd)
         self.model.load_pretrained()
-        self.model.to(self.device)
+        if self.model.quantized_backbone:
+            self.model.move_trainable_modules(self.device)
+        else:
+            self.model.to(self.device)
 
         # freeze backbone, train injection + lora + loop emb
         for p in self.model.parameters():
@@ -632,6 +646,23 @@ class SRPOTrainer:
                 })
         return results
 
+    def _training_view(
+        self,
+        ids: torch.Tensor,
+        prompt_len: int,
+    ) -> tuple[torch.Tensor, int]:
+        """Return the token window used for backprop without changing logs.
+
+        Generation and sample logging keep the full prompt/completion. This
+        optional crop only bounds recurrent activation memory during GRPO/SDPO
+        log-prob recomputation.
+        """
+        max_tokens = int(self.cfg.max_train_sequence_tokens or 0)
+        if max_tokens <= 0 or ids.shape[0] <= max_tokens:
+            return ids, prompt_len
+        start = ids.shape[0] - max_tokens
+        return ids[start:], max(0, prompt_len - start)
+
     def train_step(self, batch: list[dict], loss_scale: Optional[float] = None) -> dict:
         cfg = self.cfg
         G = cfg.group_size
@@ -684,7 +715,14 @@ class SRPOTrainer:
         grpo_l = torch.tensor(0.0, device=self.device)
         policy_samples = comps
         if len(policy_samples) >= 2:
-            L_max = max(c["full_ids"].shape[0] for c in policy_samples)
+            for c in policy_samples:
+                train_ids, train_pl = self._training_view(
+                    c["full_ids"],
+                    c["prompt_len"],
+                )
+                c["train_ids"] = train_ids
+                c["train_prompt_len"] = train_pl
+            L_max = max(c["train_ids"].shape[0] for c in policy_samples)
             pad_id = self.tokenizer.pad_token_id
             if pad_id is None:
                 pad_id = self.tokenizer.eos_token_id or 0
@@ -697,11 +735,12 @@ class SRPOTrainer:
             batch_attn = torch.zeros(len(policy_samples), L_max, dtype=torch.long, device=self.device)
             batch_mask = torch.zeros(len(policy_samples), L_max, device=self.device)
             for j, c in enumerate(policy_samples):
-                L = c["full_ids"].shape[0]
-                PL = c["prompt_len"]
-                batch_ids[j, :L] = c["full_ids"].to(self.device)
+                ids_view = c["train_ids"]
+                L = ids_view.shape[0]
+                PL = c["train_prompt_len"]
+                batch_ids[j, :L] = ids_view.to(self.device)
                 batch_attn[j, :L] = 1
-                batch_mask[j, PL:L] = 1
+                batch_mask[j, max(PL, 1):L] = 1
             rwd = torch.tensor([c["reward"] for c in policy_samples], device=self.device)
             group_ids = torch.tensor([c["batch_idx"] for c in policy_samples], device=self.device)
 
@@ -722,10 +761,11 @@ class SRPOTrainer:
                 )
                 chunk_rows = []
                 for local_j, c in enumerate(policy_samples[start:end]):
-                    L = c["full_ids"].shape[0]
-                    PL = c["prompt_len"]
-                    if L > PL:
-                        gen_pos = torch.arange(PL, L, device=self.device)
+                    L = c["train_ids"].shape[0]
+                    PL = c["train_prompt_len"]
+                    loss_start = max(PL, 1)
+                    if L > loss_start:
+                        gen_pos = torch.arange(loss_start, L, device=self.device)
                         selected = logits_cur[local_j, gen_pos - 1, :]
                         selected_lp = F.log_softmax(selected.float(), dim=-1).to(selected.dtype)
                         token_lp = selected_lp.gather(
@@ -762,10 +802,11 @@ class SRPOTrainer:
                         )
                         chunk_rows = []
                         for local_j, c in enumerate(policy_samples[start:end]):
-                            L = c["full_ids"].shape[0]
-                            PL = c["prompt_len"]
-                            if L > PL:
-                                gen_pos = torch.arange(PL, L, device=self.device)
+                            L = c["train_ids"].shape[0]
+                            PL = c["train_prompt_len"]
+                            loss_start = max(PL, 1)
+                            if L > loss_start:
+                                gen_pos = torch.arange(loss_start, L, device=self.device)
                                 selected = logits_old[local_j, gen_pos - 1, :]
                                 selected_lp = F.log_softmax(selected.float(), dim=-1).to(selected.dtype)
                                 token_lp = selected_lp.gather(
@@ -840,18 +881,25 @@ class SRPOTrainer:
                         teacher_ids.append(teacher_gen[0])
                         tp_lens.append(tp_enc["input_ids"].shape[1])
 
-            TL = max(ids.shape[0] for ids in teacher_ids)
+            teacher_views = []
+            tp_lens_view = []
+            for ids, pl in zip(teacher_ids, tp_lens):
+                ids_view, pl_view = self._training_view(ids, pl)
+                teacher_views.append(ids_view)
+                tp_lens_view.append(pl_view)
+
+            TL = max(ids.shape[0] for ids in teacher_views)
             pad_id = self.tokenizer.pad_token_id
             if pad_id is None:
                 pad_id = self.tokenizer.eos_token_id or 0
             teacher_full_ids = torch.full(
-                (len(teacher_ids), TL),
+                (len(teacher_views), TL),
                 pad_id,
                 dtype=torch.long,
                 device=self.device,
             )
-            teacher_attn = torch.zeros(len(teacher_ids), TL, dtype=torch.long, device=self.device)
-            for j, ids in enumerate(teacher_ids):
+            teacher_attn = torch.zeros(len(teacher_views), TL, dtype=torch.long, device=self.device)
+            for j, ids in enumerate(teacher_views):
                 L = ids.shape[0]
                 teacher_full_ids[j, :L] = ids.to(self.device)
                 teacher_attn[j, :L] = 1
@@ -863,7 +911,7 @@ class SRPOTrainer:
             sdpo_bs = max(1, cfg.sdpo_forward_batch_size)
             total_resp_tokens = torch.tensor(
                 sum(
-                    max(0, int(teacher_attn[j].sum().item()) - int(tp_lens[j]))
+                    max(0, int(teacher_attn[j].sum().item()) - max(int(tp_lens_view[j]), 1))
                     for j in range(len(failed))
                 ),
                 device=self.device,
@@ -893,8 +941,8 @@ class SRPOTrainer:
                         )
 
                 resp_mask = torch.zeros(end - start, chunk_len, device=self.device)
-                for local_j, pl in enumerate(tp_lens[start:end]):
-                    resp_mask[local_j, pl:attn_chunk[local_j].sum().item()] = 1
+                for local_j, pl in enumerate(tp_lens_view[start:end]):
+                    resp_mask[local_j, max(pl, 1):attn_chunk[local_j].sum().item()] = 1
 
                 n_resp = resp_mask.sum()
                 if n_resp > 0:
@@ -1221,6 +1269,16 @@ def main():
                     help="Chunk size for GRPO current/reference log-prob forwards")
     ap.add_argument("--sdpo-forward-batch-size", type=int, default=None,
                     help="Chunk size for SDPO student/teacher forwards")
+    ap.add_argument("--load-backend", choices=["transformers", "unsloth"], default=None,
+                    help="Model loading backend")
+    ap.add_argument("--load-in-4bit", action="store_true",
+                    help="Use 4-bit loading with the Unsloth backend")
+    ap.add_argument("--max-seq-length", type=int, default=None,
+                    help="Unsloth max sequence length")
+    ap.add_argument("--max-train-sequence-tokens", type=int, default=None,
+                    help="Backprop window for GRPO/SDPO recomputation; 0 disables")
+    ap.add_argument("--no-activation-checkpointing", action="store_true",
+                    help="Disable checkpointing through recurrent-depth forwards")
     args = ap.parse_args()
 
     def apply_overrides(cfg: TrainConfig) -> bool:
@@ -1246,6 +1304,21 @@ def main():
         if args.sdpo_forward_batch_size is not None:
             cfg.sdpo_forward_batch_size = args.sdpo_forward_batch_size
             changed = True
+        if args.load_backend is not None:
+            cfg.load_backend = args.load_backend
+            changed = True
+        if args.load_in_4bit:
+            cfg.load_in_4bit = True
+            changed = True
+        if args.max_seq_length is not None:
+            cfg.max_seq_length = args.max_seq_length
+            changed = True
+        if args.max_train_sequence_tokens is not None:
+            cfg.max_train_sequence_tokens = args.max_train_sequence_tokens
+            changed = True
+        if args.no_activation_checkpointing:
+            cfg.use_activation_checkpointing = False
+            changed = True
         return changed
 
     if args.resume:
@@ -1258,6 +1331,11 @@ def main():
             args.no_sample_log,
             args.grpo_forward_batch_size is not None,
             args.sdpo_forward_batch_size is not None,
+            args.load_backend is not None,
+            args.load_in_4bit,
+            args.max_seq_length is not None,
+            args.max_train_sequence_tokens is not None,
+            args.no_activation_checkpointing,
         ]):
             ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
             cfg = ckpt["config"]

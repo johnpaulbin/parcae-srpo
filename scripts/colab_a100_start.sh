@@ -21,6 +21,11 @@ Common overrides:
   STEPS=100                  training steps (default: 100)
   MODEL_NAME=...             Hugging Face model id (default: google/gemma-4-E2B-it)
   MODEL_PATH=/path/to/model   local model path, if already downloaded
+  LOAD_BACKEND=unsloth       real SRPO loader: transformers or unsloth
+  LOAD_IN_4BIT=1             use Unsloth 4-bit loading for the Gemma backbone
+  MAX_SEQ_LENGTH=2048        Unsloth setup sequence length
+  MAX_TRAIN_SEQUENCE_TOKENS=384
+                              backprop window; full samples are still logged
   DATASET=humaneval_mbpp_mix dataset name
   MAX_PROMPTS=500            number of dataset prompts
   GROUP_SIZE=4               completions per prompt
@@ -34,8 +39,9 @@ Common overrides:
   SAMPLE_LOG_EVERY=1         print full samples every N steps
   SAMPLE_LOG_PROMPTS=1       prompt groups to print per sample log
   SAMPLE_LOG_PATH=...        JSONL path for full sample logs
+  USE_ACTIVATION_CHECKPOINTING=1
   RUN_TESTS=1                run focused tests before training
-  PREDOWNLOAD=1              predownload the model before training
+  PREDOWNLOAD=0              predownload model before training; defaults off for Unsloth
   SKIP_INSTALL=1             skip pip install
 
 Example:
@@ -54,9 +60,21 @@ cd "${REPO_ROOT}"
 
 PYTHON="${PYTHON:-python3}"
 MODEL_NAME="${MODEL_NAME:-google/gemma-4-E2B-it}"
+LOAD_BACKEND="${LOAD_BACKEND:-unsloth}"
+LOAD_IN_4BIT="${LOAD_IN_4BIT:-1}"
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-2048}"
+MAX_TRAIN_SEQUENCE_TOKENS="${MAX_TRAIN_SEQUENCE_TOKENS:-384}"
 HF_HOME="${HF_HOME:-/content/hf-cache}"
 HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/content/hf-datasets-cache}"
 SAMPLE_LOG_PATH="${SAMPLE_LOG_PATH:-runs/colab_a100_samples.jsonl}"
+
+if [[ -z "${PREDOWNLOAD+x}" ]]; then
+    if [[ "${LOAD_BACKEND}" == "unsloth" ]]; then
+        PREDOWNLOAD=0
+    else
+        PREDOWNLOAD=1
+    fi
+fi
 
 export HF_HOME
 export HF_DATASETS_CACHE
@@ -81,7 +99,11 @@ fi
 if [[ "${SKIP_INSTALL:-0}" != "1" ]]; then
     echo "=== Installing repo and training dependencies ==="
     "${PYTHON}" -m pip install -q --upgrade pip wheel "setuptools<82"
-    "${PYTHON}" -m pip install -q -e ".[train,test]" "huggingface_hub>=0.24"
+    if [[ "${LOAD_BACKEND}" == "unsloth" ]]; then
+        "${PYTHON}" -m pip install -q -e ".[train,test,unsloth]" "huggingface_hub>=0.24"
+    else
+        "${PYTHON}" -m pip install -q -e ".[train,test]" "huggingface_hub>=0.24"
+    fi
 fi
 
 if [[ -n "${HF_TOKEN:-}" ]]; then
@@ -97,7 +119,7 @@ else
     echo "WARNING: HF_TOKEN is not set. This is okay only if the model is public or already cached."
 fi
 
-if [[ "${PREDOWNLOAD:-1}" == "1" && -z "${MODEL_PATH:-}" ]]; then
+if [[ "${PREDOWNLOAD}" == "1" && -z "${MODEL_PATH:-}" ]]; then
     echo "=== Predownloading model: ${MODEL_NAME} ==="
     MODEL_NAME="${MODEL_NAME}" "${PYTHON}" - <<'PY'
 import os
@@ -129,6 +151,11 @@ echo "Tip: in another Colab cell, run: !tail -n 80 ${SAMPLE_LOG_PATH}"
 
 MODEL_NAME="${MODEL_NAME}" \
 MODEL_PATH="${MODEL_PATH:-}" \
+LOAD_BACKEND="${LOAD_BACKEND}" \
+LOAD_IN_4BIT="${LOAD_IN_4BIT}" \
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH}" \
+MAX_TRAIN_SEQUENCE_TOKENS="${MAX_TRAIN_SEQUENCE_TOKENS}" \
+USE_ACTIVATION_CHECKPOINTING="${USE_ACTIVATION_CHECKPOINTING:-1}" \
 DATASET="${DATASET:-humaneval_mbpp_mix}" \
 MAX_PROMPTS="${MAX_PROMPTS:-500}" \
 STEPS="${STEPS:-100}" \
@@ -162,10 +189,22 @@ def float_env(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
+def bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 cfg = TrainConfig()
 cfg.model_name = os.environ["MODEL_NAME"]
 if os.environ.get("MODEL_PATH"):
     cfg.model_path = os.environ["MODEL_PATH"]
+cfg.load_backend = os.environ["LOAD_BACKEND"]
+cfg.load_in_4bit = bool_env("LOAD_IN_4BIT", cfg.load_in_4bit)
+cfg.max_seq_length = int_env("MAX_SEQ_LENGTH", cfg.max_seq_length)
+cfg.max_train_sequence_tokens = int_env("MAX_TRAIN_SEQUENCE_TOKENS", cfg.max_train_sequence_tokens)
+cfg.use_activation_checkpointing = bool_env("USE_ACTIVATION_CHECKPOINTING", cfg.use_activation_checkpointing)
 cfg.dataset = os.environ["DATASET"]
 cfg.max_prompts = int_env("MAX_PROMPTS", cfg.max_prompts)
 cfg.total_steps = int_env("STEPS", cfg.total_steps)
@@ -190,6 +229,10 @@ print("Training config:")
 for name in [
     "model_name",
     "model_path",
+    "load_backend",
+    "load_in_4bit",
+    "max_seq_length",
+    "use_activation_checkpointing",
     "dataset",
     "max_prompts",
     "total_steps",
@@ -200,6 +243,7 @@ for name in [
     "gradient_accumulation_steps",
     "grpo_forward_batch_size",
     "sdpo_forward_batch_size",
+    "max_train_sequence_tokens",
     "poisson_mean",
     "max_loops",
     "learning_rate",

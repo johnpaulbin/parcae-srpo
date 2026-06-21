@@ -69,25 +69,13 @@ prompts. This is slower for long outputs. The authoritative training loop is
 `scripts/train_srpo.py`; future throughput work can add a maintained vLLM
 generation backend without duplicating the trainer.
 
-For Colab-scale experiments, the preferred path is now the Unsloth SRPO-lite
-extension in `scripts/train_unsloth_srpo.py`. It does not physically loop the
-Gemma 4 hidden states. Instead it uses Unsloth + TRL GRPO with QLoRA and trains
-a smaller code model to emit explicit internal thinking loops:
-
-````text
-<think_loop_1>...</think_loop_1>
-<think_loop_2>...</think_loop_2>
-<think_loop_3>...</think_loop_3>
-<answer>
-```python
-...
-```
-</answer>
-````
-
-This trades recurrent architectural novelty for practical A100 throughput and
-fits the way Unsloth teaches reasoning models: sampled completions, verifier
-rewards, and structured reasoning tags.
+For Colab-scale experiments, `scripts/colab_a100_start.sh` can load the same
+internal-loop Gemma 4 retrofit through Unsloth in 4-bit mode. Unsloth is used
+only as a memory-efficient model loader; the forward pass still physically
+runs Prelude -> Recurrent loop -> Coda inside `RecurrentDepthGemma`.
+Activation checkpointing is enabled by default, and the Colab launcher uses a
+training-only token window to keep GRPO/SDPO backprop memory bounded while
+still generating and logging full completions.
 
 DDP training has been verified through code-path analysis and single-GPU
 gloo smoke tests but has not been run on a multi-GPU node with NCCL. We
@@ -132,7 +120,7 @@ torchrun --nproc_per_node=2 scripts/train_srpo.py         # multi-GPU DDP
 Colab A100 quickstart:
 
 ```bash
-git clone https://github.com/IgorAlexey/parcae-srpo.git
+git clone https://github.com/johnpaulbin/parcae-srpo.git
 cd parcae-srpo
 HF_TOKEN=hf_... STEPS=100 bash scripts/colab_a100_start.sh
 ```
@@ -140,18 +128,19 @@ HF_TOKEN=hf_... STEPS=100 bash scripts/colab_a100_start.sh
 In a notebook, use shell cells:
 
 ```bash
-!git clone https://github.com/IgorAlexey/parcae-srpo.git
+!git clone https://github.com/johnpaulbin/parcae-srpo.git
 %cd parcae-srpo
 !HF_TOKEN=hf_... STEPS=100 bash scripts/colab_a100_start.sh
 ```
 
 The Colab script installs the package, checks that CUDA is available, warns if
-the runtime is not an A100, predownloads the model when possible, runs focused
-tests, and starts a single-GPU A100 training run. It defaults to full sample
-logging every step for easy inspection. The trainer chunks GRPO and SDPO
-forward passes by default on Colab, so the long 512-token code budget can run
-on 40GB A100 runtimes without batching all correction sequences into one giant
-KL forward. While it is running, inspect samples with:
+the runtime is not an A100, runs focused tests, and starts a single-GPU A100
+training run. It defaults to `LOAD_BACKEND=unsloth`, `LOAD_IN_4BIT=1`,
+activation checkpointing, full sample logging every step, and
+`MAX_TRAIN_SEQUENCE_TOKENS=384`. The trainer still generates up to
+`MAX_RESPONSE_TOKENS=512` tokens and logs the full prompt and completion; the
+training window only limits the backprop graph. While it is running, inspect
+samples with:
 
 ```bash
 !tail -n 80 runs/colab_a100_samples.jsonl
@@ -159,6 +148,8 @@ KL forward. While it is running, inspect samples with:
 
 If you raise `MAX_RESPONSE_TOKENS`, `GROUP_SIZE`, or `MAX_LOOPS`, keep the
 forward chunks at `GRPO_FORWARD_BATCH_SIZE=1 SDPO_FORWARD_BATCH_SIZE=1` first.
+If memory is stable, then try raising `MAX_TRAIN_SEQUENCE_TOKENS` toward the
+full prompt-plus-completion length.
 
 Useful logging flags:
 
@@ -166,27 +157,6 @@ Useful logging flags:
 python scripts/train_srpo.py --sample-log-every 5 --sample-log-prompts 2
 python scripts/train_srpo.py --sample-log-path runs/my_samples.jsonl
 ```
-
-Unsloth SRPO-lite quickstart:
-
-```bash
-pip install -e ".[unsloth,test]"
-python scripts/train_unsloth_srpo.py --max-steps 300
-```
-
-Colab A100 Unsloth launcher:
-
-```bash
-!git clone https://github.com/johnpaulbin/parcae-srpo.git
-%cd parcae-srpo
-!STEPS=300 MAX_COMPLETION_LENGTH=768 bash scripts/colab_unsloth_srpo_start.sh
-```
-
-The default Unsloth model is
-`unsloth/Qwen2.5-Coder-3B-Instruct-bnb-4bit`. It trains with
-`NUM_GENERATIONS=4`, `TEMPERATURE=1.2`, `LOSS_TYPE=dapo`, and `BETA=0.0` by
-default. Raise `STEPS` first; then consider `MAX_COMPLETION_LENGTH=1024` or
-`NUM_GENERATIONS=6` on A100 if memory allows.
 
 ## Tests
 
