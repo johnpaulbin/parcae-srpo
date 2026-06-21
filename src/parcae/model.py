@@ -323,11 +323,21 @@ class RecurrentDepthGemma(nn.Module):
         elif backend == "unsloth":
             try:
                 from unsloth import FastLanguageModel
-            except ImportError as exc:
-                raise ImportError(
-                    "The Unsloth backend requires `pip install -e .[unsloth]` "
-                    "or `pip install unsloth`."
-                ) from exc
+            except Exception as exc:
+                if not self.cfg.load_in_4bit:
+                    raise ImportError(
+                        "The Unsloth backend requires a working `unsloth` "
+                        "installation."
+                    ) from exc
+                warnings.warn(
+                    "Unsloth import failed; falling back to Transformers "
+                    f"bitsandbytes 4-bit loading. Original error: {exc}",
+                    RuntimeWarning,
+                )
+                hf_model = _load_transformers(load_in_4bit=True)
+                backend = "transformers-bnb"
+                self._quantized_backbone = True
+                FastLanguageModel = None
             unsloth_kwargs = {
                 "model_name": self.cfg.model_path,
                 "max_seq_length": self.cfg.max_seq_length,
@@ -336,26 +346,27 @@ class RecurrentDepthGemma(nn.Module):
                 "fast_inference": self.cfg.fast_inference,
                 "trust_remote_code": True,
             }
-            try:
+            if FastLanguageModel is not None:
                 try:
-                    hf_model, _tokenizer = FastLanguageModel.from_pretrained(**unsloth_kwargs)
-                except TypeError as exc:
-                    if "trust_remote_code" not in str(exc):
+                    try:
+                        hf_model, _tokenizer = FastLanguageModel.from_pretrained(**unsloth_kwargs)
+                    except TypeError as exc:
+                        if "trust_remote_code" not in str(exc):
+                            raise
+                        unsloth_kwargs.pop("trust_remote_code", None)
+                        hf_model, _tokenizer = FastLanguageModel.from_pretrained(**unsloth_kwargs)
+                    self._quantized_backbone = bool(self.cfg.load_in_4bit)
+                except Exception as exc:
+                    if not self.cfg.load_in_4bit:
                         raise
-                    unsloth_kwargs.pop("trust_remote_code", None)
-                    hf_model, _tokenizer = FastLanguageModel.from_pretrained(**unsloth_kwargs)
-                self._quantized_backbone = bool(self.cfg.load_in_4bit)
-            except Exception as exc:
-                if not self.cfg.load_in_4bit:
-                    raise
-                warnings.warn(
-                    "Unsloth loading failed; falling back to Transformers "
-                    f"bitsandbytes 4-bit loading. Original error: {exc}",
-                    RuntimeWarning,
-                )
-                hf_model = _load_transformers(load_in_4bit=True)
-                backend = "transformers-bnb"
-                self._quantized_backbone = True
+                    warnings.warn(
+                        "Unsloth loading failed; falling back to Transformers "
+                        f"bitsandbytes 4-bit loading. Original error: {exc}",
+                        RuntimeWarning,
+                    )
+                    hf_model = _load_transformers(load_in_4bit=True)
+                    backend = "transformers-bnb"
+                    self._quantized_backbone = True
         else:
             raise ValueError(
                 f"Unknown load_backend={self.cfg.load_backend!r}; "

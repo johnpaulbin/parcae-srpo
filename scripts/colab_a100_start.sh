@@ -110,8 +110,6 @@ if [[ "${LOAD_BACKEND}" == "unsloth" ]]; then
     echo "=== Checking Transformers Gemma 4 support ==="
     "${PYTHON}" - <<'PY'
 import importlib.util
-import subprocess
-import sys
 
 
 def has_gemma4() -> bool:
@@ -122,27 +120,17 @@ def has_gemma4() -> bool:
 
 
 if not has_gemma4():
-    print("Gemma 4 module missing after install; upgrading Transformers.")
-    subprocess.check_call([
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "-q",
-        "--upgrade",
-        "--pre",
-        "transformers",
-    ])
-
-if has_gemma4():
+    print(
+        "Transformers local Gemma 4 module is missing. Continuing without "
+        "upgrading Transformers because current Unsloth releases require "
+        "Transformers <= 4.57.2. The model loader will try trusted remote "
+        "model code or fall back to Transformers 4-bit loading if Unsloth "
+        "cannot import."
+    )
+else:
     import transformers
 
     print(f"Transformers Gemma 4 support detected: {transformers.__version__}")
-else:
-    print(
-        "WARNING: Transformers still has no local Gemma 4 module. "
-        "Training will try trusted remote model code at load time."
-    )
 PY
 fi
 

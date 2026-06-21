@@ -35,6 +35,18 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
+if os.environ.get("LOAD_BACKEND", "").strip().lower() == "unsloth":
+    try:
+        import unsloth as _unsloth  # noqa: F401
+    except Exception as exc:
+        print(
+            "WARNING: Unsloth failed to import before Transformers; "
+            "falling back to Transformers 4-bit loading. "
+            f"Original error: {exc}",
+            file=sys.stderr,
+        )
+        os.environ["LOAD_BACKEND"] = "transformers"
+
 from transformers import AutoTokenizer
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
